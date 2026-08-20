@@ -13,6 +13,11 @@ targets:
     platform: iOS
     sources:
       - App/Sources
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: YOUR_TEAM_ID
+        TARGETED_DEVICE_FAMILY: "1"
     info:
       path: App/Info.plist
       properties:
@@ -21,9 +26,6 @@ targets:
         NSCameraUsageDescription: DualPresenter records the back camera view of the content you present.
         NSMicrophoneUsageDescription: DualPresenter records your voice together with the presentation.
         NSPhotoLibraryAddUsageDescription: DualPresenter saves finished videos to your photo library.
-    settings:
-      base:
-        TARGETED_DEVICE_FAMILY: "1"
   DualPresenterTests:
     type: bundle.unit-test
     platform: iOS
