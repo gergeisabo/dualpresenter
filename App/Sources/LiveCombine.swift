@@ -1,33 +1,59 @@
-import AVFoundation
 import CoreGraphics
 import CoreVideo
 import VideoToolbox
 
-/// Live combine core: draws the front-camera bubble on top of the back-camera
-/// frame into one BGRA pixel buffer, in real time during recording.
-///
-/// Pure CoreVideo/CoreGraphics — no UIKit — so the exact same file compiles
-/// on macOS for offline verification (see Tests and the Mac harness).
-enum LiveCombine {
+/// Where the face bubble sits, in normalized CANVAS coordinates
+/// (origin top-left, 0...1 of the 1080x1920 frame). Shared by the
+/// on-screen preview and the recorder, so the file matches what you
+/// see while recording (WYSIWYG), including mid-recording drags.
+struct BubblePlacement: Equatable {
+    var centerX: CGFloat   // 0...1 of canvas width
+    var centerY: CGFloat   // 0...1 of canvas height
+    var side: CGFloat      // bubble side as 0...1 of canvas width
 
-    /// Bubble frame in canvas (back-buffer) coordinates, portrait.
-    /// Side = 25% of canvas width, centered, near the top.
-    static func bubbleRect(canvas: CGSize) -> CGRect {
-        let side = canvas.width * 0.25
-        let top = canvas.height * 0.05
-        return CGRect(
-            x: (canvas.width - side) / 2,
-            y: top,
-            width: side,
-            height: side)
+    /// Starting placement: bottom-right with the standard 16pt inset.
+    static let standard = BubblePlacement(centerX: 0.82, centerY: 0.92, side: 0.28)
+
+    /// Clamped so the whole bubble stays inside the canvas.
+    func clampedToCanvas() -> BubblePlacement {
+        // Bubble side expressed as a fraction of canvas HEIGHT.
+        let hFrac = side * (1080.0 / 1920.0)
+        let x = min(max(centerX, side / 2), 1 - side / 2)
+        let y = min(max(centerY, hFrac / 2), 1 - hFrac / 2)
+        return BubblePlacement(centerX: x, centerY: y, side: side)
     }
 
-    /// Draws `back` full-frame and `front` aspect-fill inside the bubble.
-    /// `dest` must be a locked 32BGRA buffer sized like the back buffer.
-    /// Both source buffers may be any CVPixelBuffer format VideoToolbox can
-    /// convert (native camera output included).
+    /// Converts to CoreGraphics canvas coordinates (origin BOTTOM-left).
+    ///
+    /// The pixel buffer is CG-flipped: CG y = 0 maps to the physical
+    /// BOTTOM row of the video (verified by the Mac orientation probe).
+    /// Screen-style top-down fractions must therefore be inverted.
+    func rect(in canvas: CGSize) -> CGRect {
+        let s = side * canvas.width
+        let cx = centerX * canvas.width
+        let cy = (1 - centerY) * canvas.height
+        return CGRect(x: cx - s / 2, y: cy - s / 2, width: s, height: s)
+    }
+}
+
+/// Live combine core: draws the front-camera bubble on top of the
+/// back-camera frame into one BGRA pixel buffer, in real time during
+/// recording.
+///
+/// Pure CoreVideo/CoreGraphics — no UIKit — so the exact same file
+/// compiles on macOS for offline verification (see Tests and the Mac
+/// harness).
+enum LiveCombine {
+
+    /// Draws `back` full-frame and `front` aspect-fill inside the bubble
+    /// at `placement`. `dest` must be a locked 32BGRA buffer sized like
+    /// the back buffer. Both source buffers may be any CVPixelBuffer
+    /// format VideoToolbox can convert (native camera output included).
     static func draw(
-        back: CVPixelBuffer, front: CVPixelBuffer?, dest: CVPixelBuffer
+        back: CVPixelBuffer,
+        front: CVPixelBuffer?,
+        placement: BubblePlacement,
+        dest: CVPixelBuffer
     ) {
         let width = CVPixelBufferGetWidth(dest)
         let height = CVPixelBufferGetHeight(dest)
@@ -54,10 +80,12 @@ enum LiveCombine {
 
         guard let front, let frontImage = cgImage(from: front) else { return }
 
-        let bubble = bubbleRect(canvas: canvas.size)
+        let bubble = placement.rect(in: canvas.size)
         let path = CGPath(
             roundedRect: bubble,
-            cornerWidth: 24, cornerHeight: 24, transform: nil)
+            cornerWidth: min(64, bubble.width * 0.11),
+            cornerHeight: min(64, bubble.width * 0.11),
+            transform: nil)
         ctx.saveGState()
         ctx.addPath(path)
         ctx.clip()
@@ -83,6 +111,7 @@ enum LiveCombine {
     }
 
     /// BGRA pixel-reading helper used by tests (Mac + unit tests).
+    /// Memory row 0 is the TOP row of the image (physical, screen-style).
     static func rgba(
         of buffer: CVPixelBuffer, x: Int, y: Int
     ) -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8)? {

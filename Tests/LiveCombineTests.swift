@@ -1,108 +1,130 @@
-import CoreVideo
 import XCTest
+import CoreVideo
 @testable import DualPresenter
 
-/// Pixel-level tests for LiveCombine: green back frame full-frame, red
-/// front frame clipped into the bubble, nil-front tolerated.
 final class LiveCombineTests: XCTestCase {
 
-    private let W = 1080, H = 1920
-
-    private func makeBuffer(
-        w: Int, h: Int, r: UInt8, g: UInt8, b: UInt8
-    ) -> CVPixelBuffer? {
+    private func makeBuffer(_ w: Int, _ h: Int) -> CVPixelBuffer {
         var buf: CVPixelBuffer?
-        let attrs: [CFString: Any] = [kCVPixelBufferCGImageCompatibilityKey: true]
-        guard CVPixelBufferCreate(
-            kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary, &buf) == kCVReturnSuccess, let buffer = buf
-        else { return nil }
-        CVPixelBufferLockBaseAddress(buffer, [])
-        let bpr = CVPixelBufferGetBytesPerRow(buffer)
-        let base = CVPixelBufferGetBaseAddress(buffer)!
-            .assumingMemoryBound(to: UInt8.self)
-        for row in 0..<h {
-            for col in 0..<w {
-                let p = row * bpr + col * 4
-                base[p + 0] = b
-                base[p + 1] = g
-                base[p + 2] = r
-                base[p + 3] = 255
+        CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &buf)
+        return buf!
+    }
+
+    private func fill(
+        _ buf: CVPixelBuffer, r: UInt8, g: UInt8, b: UInt8
+    ) {
+        CVPixelBufferLockBaseAddress(buf, [])
+        let base = CVPixelBufferGetBaseAddress(buf)!.assumingMemoryBound(to: UInt8.self)
+        let bpr = CVPixelBufferGetBytesPerRow(buf)
+        for y in 0..<CVPixelBufferGetHeight(buf) {
+            for x in 0..<CVPixelBufferGetWidth(buf) {
+                let o = y * bpr + x * 4
+                base[o + 0] = b; base[o + 1] = g; base[o + 2] = r; base[o + 3] = 255
             }
         }
-        CVPixelBufferUnlockBaseAddress(buffer, [])
-        return buffer
+        CVPixelBufferUnlockBaseAddress(buf, [])
     }
 
-    private func rgb(
-        _ buf: CVPixelBuffer, _ x: Int, _ y: Int
-    ) -> (Int, Int, Int) {
-        let c = LiveCombine.rgba(of: buf, x: x, y: y)!
-        return (Int(c.r), Int(c.g), Int(c.b))
+    private func isRed(_ c: (r: UInt8, g: UInt8, b: UInt8, a: UInt8)?) -> Bool {
+        guard let c else { return false }
+        return c.r > 200 && c.g < 80 && c.b < 80
     }
 
-    private var bubbleTopDown: CGRect {
-        let cg = LiveCombine.bubbleRect(canvas: CGSize(width: W, height: H))
-        return CGRect(
-            x: cg.minX, y: CGFloat(H) - cg.maxY,
-            width: cg.width, height: cg.height)
+    private func isGreen(_ c: (r: UInt8, g: UInt8, b: UInt8, a: UInt8)?) -> Bool {
+        guard let c else { return false }
+        return c.g > 200 && c.r < 80 && c.b < 80
     }
 
-    func testBackFrameIsDrawnFullScreen() throws {
-        let back = try XCTUnwrap(makeBuffer(w: W, h: H, r: 0, g: 255, b: 0))
-        let dest = try XCTUnwrap(makeBuffer(w: W, h: H, r: 0, g: 0, b: 0))
+    private func combined(
+        placement: BubblePlacement
+    ) -> CVPixelBuffer {
+        let back = makeBuffer(1080, 1920)
+        fill(back, r: 0, g: 255, b: 0)   // green "back camera"
+        let front = makeBuffer(720, 1280)
+        fill(front, r: 255, g: 0, b: 0)  // red "front camera"
+        let dest = makeBuffer(1080, 1920)
         CVPixelBufferLockBaseAddress(dest, [])
-        LiveCombine.draw(back: back, front: nil, dest: dest)
+        LiveCombine.draw(
+            back: back, front: front, placement: placement, dest: dest)
         CVPixelBufferUnlockBaseAddress(dest, [])
-
-        let c = rgb(dest, W / 2, H / 2)
-        XCTAssertGreaterThan(c.1, 200, "center should be green")
-        XCTAssertLessThan(c.0, 50)
+        return dest
     }
 
-    func testFrontBubbleIsDrawnInsideRect() throws {
-        let back = try XCTUnwrap(makeBuffer(w: W, h: H, r: 0, g: 255, b: 0))
-        let front = try XCTUnwrap(makeBuffer(w: 720, h: 1280, r: 255, g: 0, b: 0))
-        let dest = try XCTUnwrap(makeBuffer(w: W, h: H, r: 0, g: 0, b: 0))
+    // MARK: Flip fix
+
+    func testBubbleLandsBottomRightInVideo() {
+        // Screen-style bottom-right placement (what the user sees).
+        let p = BubblePlacement.standard   // (0.82, 0.92)
+        let dest = combined(placement: p)
+
+        // Memory row 0 = TOP of the image.
+        // Bubble center in the VIDEO: x = 0.82*1080, y = 0.92*1920.
+        XCTAssertTrue(isRed(LiveCombine.rgba(of: dest, x: 885, y: 1766)),
+                      "bubble center must be bottom-right in the video")
+        XCTAssertFalse(isRed(LiveCombine.rgba(of: dest, x: 885, y: 153)),
+                       "old flipped draw put the bubble at the top")
+        XCTAssertFalse(isRed(LiveCombine.rgba(of: dest, x: 195, y: 1766)),
+                       "old centered draw put the bubble mid-width")
+    }
+
+    func testPlacementRectFlipMath() {
+        // Canvas-normalized top must become CG BOTTOM (probe: CG y=0 is
+        // the physical bottom row). Screen 0.0 (top) -> CG y = height.
+        let top = BubblePlacement(centerX: 0.5, centerY: 0.0, side: 0.25)
+        let r = top.rect(in: CGSize(width: 1080, height: 1920))
+        XCTAssertEqual(r.midY, 1920 - 0 * 1920, accuracy: 1)
+        let bottom = BubblePlacement(centerX: 0.5, centerY: 1.0, side: 0.25)
+        let r2 = bottom.rect(in: CGSize(width: 1080, height: 1920))
+        XCTAssertEqual(r2.midY, 0, accuracy: 1)
+    }
+
+    // MARK: Still works: scene full-frame, bubble clipped to its box
+
+    func testSceneAndBubbleBasics() {
+        let dest = combined(placement: .standard)
+        // Scene fills everything outside the bubble.
+        XCTAssertTrue(isGreen(LiveCombine.rgba(of: dest, x: 100, y: 100)))
+        XCTAssertTrue(isGreen(LiveCombine.rgba(of: dest, x: 100, y: 1819)))
+        XCTAssertTrue(isGreen(LiveCombine.rgba(of: dest, x: 979, y: 100)))
+        // Front content stays inside the bubble box (aspect-fill crop).
+        let s = 0.28 * 1080   // 302 px side
+        let cx = Int(0.82 * 1080), cy = Int(0.92 * 1920)
+        XCTAssertTrue(isRed(LiveCombine.rgba(of: dest, x: cx - Int(s / 2) + 8, y: cy)))
+        XCTAssertTrue(isRed(LiveCombine.rgba(of: dest, x: cx + Int(s / 2) - 8, y: cy)))
+        XCTAssertFalse(isRed(LiveCombine.rgba(of: dest, x: cx - Int(s / 2) - 15, y: cy)))
+        XCTAssertFalse(isRed(LiveCombine.rgba(of: dest, x: cx + Int(s / 2) + 15, y: cy)))
+    }
+
+    func testTopPlacementLandsTopInVideo() {
+        // A drag to the screen-top must land at the video-top.
+        let dest = combined(
+            placement: BubblePlacement(centerX: 0.5, centerY: 0.08, side: 0.28))
+        XCTAssertTrue(isRed(LiveCombine.rgba(of: dest, x: 540, y: 153)))
+        XCTAssertFalse(isRed(LiveCombine.rgba(of: dest, x: 540, y: 1766)))
+    }
+
+    // MARK: Clamping
+
+    func testClampingKeepsBubbleInsideCanvas() {
+        let p = BubblePlacement(centerX: 0.0, centerY: 0.0, side: 0.28)
+            .clampedToCanvas()
+        let dest = combined(placement: p)
+        XCTAssertTrue(isRed(LiveCombine.rgba(of: dest, x: 10, y: 10)),
+                      "bubble at canvas top-left corner, fully inside")
+        XCTAssertFalse(isRed(LiveCombine.rgba(of: dest, x: 0, y: 0)),
+                       "nothing outside the canvas")
+    }
+
+    // MARK: No front frame yet
+
+    func testBackOnlyWhenNoFront() {
+        let back = makeBuffer(1080, 1920)
+        fill(back, r: 0, g: 255, b: 0)
+        let dest = makeBuffer(1080, 1920)
         CVPixelBufferLockBaseAddress(dest, [])
-        LiveCombine.draw(back: back, front: front, dest: dest)
+        LiveCombine.draw(
+            back: back, front: nil, placement: .standard, dest: dest)
         CVPixelBufferUnlockBaseAddress(dest, [])
-
-        let bubble = bubbleTopDown
-        let inside = rgb(
-            dest, Int(bubble.midX), Int(bubble.midY))
-        XCTAssertGreaterThan(inside.0, 200, "bubble center should be red")
-        XCTAssertLessThan(inside.1, 50)
-
-        let insideEdge = rgb(
-            dest, Int(bubble.minX + 30), Int(bubble.midY))
-        XCTAssertGreaterThan(insideEdge.0, 200)
-
-        let outside = rgb(
-            dest, Int(bubble.minX - 40), Int(bubble.midY))
-        XCTAssertGreaterThan(outside.1, 200, "outside bubble should be green")
-        XCTAssertLessThan(outside.0, 50)
-    }
-
-    func testNilFrontLeavesCanvasUntouched() throws {
-        let back = try XCTUnwrap(makeBuffer(w: W, h: H, r: 0, g: 255, b: 0))
-        let dest = try XCTUnwrap(makeBuffer(w: W, h: H, r: 0, g: 0, b: 0))
-        CVPixelBufferLockBaseAddress(dest, [])
-        LiveCombine.draw(back: back, front: nil, dest: dest)
-        CVPixelBufferUnlockBaseAddress(dest, [])
-
-        let bubble = bubbleTopDown
-        let c = rgb(dest, Int(bubble.midX), Int(bubble.midY))
-        XCTAssertGreaterThan(c.1, 200, "bubble area stays back frame")
-    }
-
-    func testBubbleRectGeometry() {
-        let rect = LiveCombine.bubbleRect(
-            canvas: CGSize(width: W, height: H))
-        XCTAssertEqual(rect.width, 270, accuracy: 1)
-        XCTAssertEqual(rect.height, 270, accuracy: 1)
-        // centered horizontally, near the top
-        XCTAssertEqual(rect.midX, 540, accuracy: 1)
-        XCTAssertLessThan(rect.minY, 200)
+        XCTAssertTrue(isGreen(LiveCombine.rgba(of: dest, x: 885, y: 1766)))
     }
 }

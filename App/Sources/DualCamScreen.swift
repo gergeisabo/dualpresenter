@@ -1,10 +1,12 @@
 import SwiftUI
 
 /// Dual Cam recording screen: full-frame back preview, draggable face
-/// bubble, one Record/Stop button, elapsed readout, error banner.
+/// bubble (the recording matches its position — WYSIWYG), CapCut-style
+/// social safe-zone guides, one Record/Stop button, elapsed readout.
 struct DualCamScreen: View {
     @StateObject private var recorder = DualCamRecorder()
-    @State private var bubbleCorner: BubbleCorner = .bottomRight
+    @State private var placement: BubblePlacement = .standard
+    @State private var guide: SocialPlatform?
     @State private var showFinish = false
     @Environment(\.dismiss) private var dismiss
 
@@ -15,9 +17,11 @@ struct DualCamScreen: View {
             if recorder.ready {
                 BackPreview(recorder: recorder)
                     .ignoresSafeArea()
+                SocialGuidesView(platform: guide)
+                    .ignoresSafeArea()
                 FaceBubble(
                     recorder: recorder,
-                    corner: $bubbleCorner,
+                    placement: $placement,
                     bubbleSize: 110
                 )
             } else {
@@ -28,11 +32,17 @@ struct DualCamScreen: View {
 
             VStack {
                 header
+                if recorder.state != .recording {
+                    guidePicker
+                }
                 Spacer()
                 controls
             }
         }
         .onAppear { recorder.setUp() }
+        .onChange(of: placement) { _, new in
+            recorder.bubblePlacement = new
+        }
         .onChange(of: recorder.state) { _, newState in
             if case .finished = newState { showFinish = true }
         }
@@ -79,6 +89,34 @@ struct DualCamScreen: View {
         .padding(.vertical, 8)
         .frame(minWidth: 76)
         .background(.black.opacity(0.4), in: Capsule())
+    }
+
+    /// CapCut-style platform guide switcher (preview-only aid).
+    private var guidePicker: some View {
+        HStack(spacing: 8) {
+            guideChip("Off", platform: nil)
+            ForEach(SocialPlatform.allCases) { platform in
+                guideChip(platform.label, platform: platform)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+    }
+
+    private func guideChip(_ label: String, platform: SocialPlatform?) -> some View {
+        Button {
+            guide = platform
+        } label: {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(guide == platform ? .black : .white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(
+                    guide == platform ? Color.white : Color.black.opacity(0.4),
+                    in: Capsule()
+                )
+        }
     }
 
     private var controls: some View {

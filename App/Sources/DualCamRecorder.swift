@@ -27,6 +27,9 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
     @Published private(set) var state: State = .idle
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var ready = false   // true once previews can attach
+    /// Current bubble placement, canvas-normalized. Set by the UI (drags);
+    /// read on the video queue for each combined frame — WYSIWYG.
+    var bubblePlacement: BubblePlacement = .standard
 
     let session = AVCaptureMultiCamSession()
 
@@ -299,7 +302,10 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         guard let dest = destMaybe else { return }
 
         CVPixelBufferLockBaseAddress(dest, [])
-        LiveCombine.draw(back: pixelBuffer, front: latestFront, dest: dest)
+        let placement = bubblePlacement
+        LiveCombine.draw(
+            back: pixelBuffer, front: latestFront,
+            placement: placement, dest: dest)
         CVPixelBufferUnlockBaseAddress(dest, [])
 
         if !writerStarted {
