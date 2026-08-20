@@ -174,13 +174,15 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         sessionQueue.async { [self] in
             guard phase == .ready else { return }
             do {
-                let back = try makeWriter(bitRate: 10_000_000, audio: true)
+                let back = try makeWriter(
+                    bitRate: 10_000_000, width: 1080, height: 1920, audio: true)
                 backWriter = back.writer
                 backVideoInput = back.video
                 backAudioInput = back.audio
                 backAdaptor = back.adaptor
                 backURL = back.url
-                let front = try makeWriter(bitRate: 5_000_000, audio: false)
+                let front = try makeWriter(
+                    bitRate: 5_000_000, width: 720, height: 1280, audio: false)
                 frontWriter = front.writer
                 frontVideoInput = front.video
                 frontAdaptor = front.adaptor
@@ -236,7 +238,7 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
     // MARK: - Writers
 
     private func makeWriter(
-        bitRate: Int, audio: Bool
+        bitRate: Int, width: Int, height: Int, audio: Bool
     ) throws -> (writer: AVAssetWriter, video: AVAssetWriterInput,
                  audio: AVAssetWriterInput?, adaptor: AVAssetWriterInputPixelBufferAdaptor,
                  url: URL) {
@@ -244,10 +246,14 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
             .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
-        // No width/height in settings: they are taken from the appended
-        // buffers, so they always match the rotated camera output.
+        // Width/height are REQUIRED on iOS 18 AVFoundation — omitting them
+        // throws "Missing required key AVVideoHeightKey" (verified on device
+        // 2026-08-20, crash log 155017). Portrait dims match the rotated
+        // camera buffers we append.
         let video = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: bitRate,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
