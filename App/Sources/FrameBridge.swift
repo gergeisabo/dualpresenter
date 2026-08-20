@@ -261,7 +261,7 @@ enum FrameBridge {
 
     // MARK: - Reader (app side)
 
-    struct VideoFrame {
+    struct VideoFrame: @unchecked Sendable {
         let seq: UInt64
         let pts: CMTime
         let pixelBuffer: CVPixelBuffer   // private copy, safe to keep

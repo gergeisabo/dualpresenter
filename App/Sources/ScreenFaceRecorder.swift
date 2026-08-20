@@ -85,7 +85,10 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         default: return
         }
         publish(.picking)
-        RPBroadcastActivityViewController.load { [weak self] viewController, error in
+        let bundleID = Bundle.main.bundleIdentifier ?? ""
+        RPBroadcastActivityViewController.load(
+            withPreferredExtension: "\(bundleID).BroadcastUpload"
+        ) { [weak self] viewController, error in
             guard let self else { return }
             guard let viewController else {
                 self.publish(.error(
@@ -94,10 +97,18 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             }
             viewController.delegate = self
             DispatchQueue.main.async {
-                let root = UIApplication.shared.connectedScenes
+                // Present from the TOP-MOST controller. ScreenFaceScreen is
+                // itself a full-screen cover over the root — presenting
+                // from root while a cover is up is silently ignored.
+                let base = UIApplication.shared.connectedScenes
                     .compactMap { ($0 as? UIWindowScene)?.keyWindow }
+                    .compactMap { $0.rootViewController }
                     .first
-                root?.rootViewController?.present(viewController, animated: true)
+                var top = base
+                while let presented = top?.presentedViewController {
+                    top = presented
+                }
+                top?.present(viewController, animated: true)
             }
         }
     }
