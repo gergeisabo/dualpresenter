@@ -190,6 +190,11 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
                 sessionStartTime = .invalid
                 backWriterStarted = false
                 frontWriterStarted = false
+                // Writers MUST enter .writing before startSession(atSourceTime:)
+                // is called in handle() — otherwise NSInternalInconsistencyException
+                // "Cannot call method when status is 0" (verified, crash 160528).
+                backWriter?.startWriting()
+                frontWriter?.startWriting()
                 phase = .recording
                 publish(.recording)
                 startTimer()
