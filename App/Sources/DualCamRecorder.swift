@@ -102,12 +102,6 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
             .playAndRecord, mode: .videoRecording, options: [.defaultToSpeaker])
         try? AVAudioSession.sharedInstance().setActive(true)
 
-        session.beginConfiguration()
-        defer {
-            session.commitConfiguration()
-            configured = true
-        }
-
         guard
             let backCamera = AVCaptureDevice.default(
                 .builtInWideAngleCamera, for: .video, position: .back),
@@ -121,6 +115,8 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
             fail("Could not access the cameras or microphone.")
             return
         }
+
+        session.beginConfiguration()
 
         for input in [theBackInput, theFrontInput, micInput] where session.canAddInput(input) {
             session.addInput(input)
@@ -159,8 +155,14 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
             if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
         }
 
+        session.commitConfiguration()
+
+        // Start ONLY after commitConfiguration — calling startRunning
+        // between begin/commit throws NSGenericException and iOS kills
+        // the app (verified on device 2026-08-20, crash log 153502).
         session.startRunning()
 
+        configured = true
         DispatchQueue.main.async { self.ready = true }
         phase = .ready
         publish(.idle)

@@ -19,7 +19,11 @@ struct BackPreview: UIViewRepresentable {
             let connection = AVCaptureConnection(
                 inputPort: port, videoPreviewLayer: view.previewLayer)
             if recorder.session.canAddConnection(connection) {
+                // Session mutations must be bracketed by begin/commit even
+                // while running, or AVFoundation can throw.
+                recorder.session.beginConfiguration()
                 recorder.session.addConnection(connection)
+                recorder.session.commitConfiguration()
                 connection.automaticallyAdjustsVideoMirroring = false
                 connection.isVideoMirrored = false
                 if connection.isVideoRotationAngleSupported(90) {
@@ -45,7 +49,9 @@ struct FrontPreview: UIViewRepresentable {
             let connection = AVCaptureConnection(
                 inputPort: port, videoPreviewLayer: view.previewLayer)
             if recorder.session.canAddConnection(connection) {
+                recorder.session.beginConfiguration()
                 recorder.session.addConnection(connection)
+                recorder.session.commitConfiguration()
                 connection.automaticallyAdjustsVideoMirroring = false
                 connection.isVideoMirrored = true
                 if connection.isVideoRotationAngleSupported(90) {
