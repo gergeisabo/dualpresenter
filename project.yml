@@ -7,6 +7,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
+    ENABLE_DEBUG_DYLIB: NO
+    ENABLE_EMBEDDED_CONTENT_CONTAINS_SWIFT: NO
 targets:
   DualPresenter:
     type: application
