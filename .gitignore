@@ -1,0 +1,8 @@
+# Xcode / Swift
+.DS_Store
+xcuserdata/
+DerivedData/
+build/
+*.xcodeproj
+App/Info.plist
+Tests/Info.plist

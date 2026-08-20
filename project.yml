@@ -1,0 +1,46 @@
+name: DualPresenter
+options:
+  bundleIdPrefix: com.gergeisabo
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+targets:
+  DualPresenter:
+    type: application
+    platform: iOS
+    sources:
+      - App/Sources
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: DualPresenter
+        UILaunchScreen: {}
+        NSCameraUsageDescription: DualPresenter records the back camera view of the content you present.
+        NSMicrophoneUsageDescription: DualPresenter records your voice together with the presentation.
+        NSPhotoLibraryAddUsageDescription: DualPresenter saves finished videos to your photo library.
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1"
+  DualPresenterTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+    dependencies:
+      - target: DualPresenter
+    info:
+      path: Tests/Info.plist
+schemes:
+  DualPresenter:
+    build:
+      targets:
+        DualPresenter: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - DualPresenterTests
