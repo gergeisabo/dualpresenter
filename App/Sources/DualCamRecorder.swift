@@ -3,28 +3,24 @@ import Combine
 import CoreMedia
 import UIKit
 
-/// Dual-camera capture engine (M1 "Dual Cam" mode).
+/// Dual-camera capture engine (M1 "Dual Cam" mode), RØDE-Combined-style:
+/// back camera full-frame + front-camera bubble drawn into ONE video file
+/// live while recording. Stop = finished file, no post-processing.
 ///
-/// One `AVCaptureMultiCamSession` with front + back cameras + mic. Video and
-/// audio flow through data outputs into two independent `AVAssetWriter`
-/// pipelines that write separate H.264 .mp4 files to the temp directory.
-/// The composite step is offline (record-then-composite — see Compositor).
+/// One `AVCaptureMultiCamSession`, front + back cameras + mic. Data outputs
+/// deliver frames; every back frame is composited with the latest front
+/// frame via `LiveCombine` into a single 1080x1920 BGRA buffer and appended
+/// to one `AVAssetWriter` (H.264 + AAC .mp4).
 ///
-/// Mirroring: WYSIWYG per plan — the front data connection is mirrored, so
-/// the front file is baked mirrored exactly as the preview shows it.
-///
-/// Threading: all mutable state lives on `sessionQueue` (phase/writers) or
-/// the main thread (@Published). Delegate callbacks hop onto sessionQueue.
-/// The class is @unchecked Sendable by that convention, not by data-race
-/// freedom of arbitrary field access.
+/// Threading: mutable state on `sessionQueue`; @Published on main.
+/// Delegate callbacks hop onto sessionQueue.
 final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
 
     enum State: Equatable {
         case idle            // configured, previewing, ready to record
         case settingUp
         case recording
-        case finishing
-        case finished(front: URL, back: URL)
+        case finished(URL)
         case error(String)
     }
 
@@ -34,7 +30,7 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
 
     let session = AVCaptureMultiCamSession()
 
-    // SessionQueue-confined below.
+    // sessionQueue-confined below.
     enum Phase { case idle, configuring, ready, recording, finishing }
     private var phase: Phase = .idle
 
@@ -50,22 +46,20 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
     private var frontInput: AVCaptureDeviceInput?
     private var configured = false
 
-    private var backWriter: AVAssetWriter?
-    private var backVideoInput: AVAssetWriterInput?
-    private var backAudioInput: AVAssetWriterInput?
-    private var backAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-    private var backURL: URL?
-    private var backWriterStarted = false
-
-    private var frontWriter: AVAssetWriter?
-    private var frontVideoInput: AVAssetWriterInput?
-    private var frontAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-    private var frontURL: URL?
-    private var frontWriterStarted = false
-
-    /// Shared anchor: the PTS of the first video sample. Both writers start
-    /// their sessions at this instant so the two files share one timeline.
+    // The ONE combined output file.
+    private var writer: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var audioInput: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var outputURL: URL?
+    private var writerStarted = false     // startSession called
     private var sessionStartTime: CMTime = .invalid
+
+    // Latest front frame for the bubble (replaced as they arrive).
+    private var latestFront: CVPixelBuffer?
+
+    // Recycled combined-frame buffer pool.
+    private var destPool: CVPixelBufferPool?
 
     private var startedAt: Date?
     private var timerCancellable: AnyCancellable?
@@ -124,13 +118,17 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         backInput = theBackInput
         frontInput = theFrontInput
 
-        // Formats: multicam-legal subset only (research: strict subset of all
-        // formats). Back 1080p30, front 720p30 — the WWDC19-249 hardware budget.
+        // Formats: multicam-legal subset only. Back 1080p30, front 720p30 —
+        // the WWDC19-249 hardware budget.
         backCamera.applyMultiCamFormat(minWidth: 1920, minHeight: 1080)
         frontCamera.applyMultiCamFormat(minWidth: 1280, minHeight: 720)
 
-        backVideoOutput.videoSettings = nil   // native buffers out
-        frontVideoOutput.videoSettings = nil
+        // BGRA so frames can be drawn via CoreGraphics without conversion.
+        let bgra: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        backVideoOutput.videoSettings = bgra
+        frontVideoOutput.videoSettings = bgra
         backVideoOutput.alwaysDiscardsLateVideoFrames = true
         frontVideoOutput.alwaysDiscardsLateVideoFrames = true
         backVideoOutput.setSampleBufferDelegate(self, queue: videoQueue)
@@ -142,8 +140,8 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
             session.addOutput(output)
         }
 
-        // Portrait (90°) via the modern API; mirroring explicit per plan:
-        // front file + preview mirrored, back untouched.
+        // Portrait (90°) via the modern API; mirroring explicit:
+        // front bubble mirrored like a mirror preview, back untouched.
         if let c = backVideoOutput.connection(with: .video) {
             c.automaticallyAdjustsVideoMirroring = false
             c.isVideoMirrored = false
@@ -158,9 +156,11 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         session.commitConfiguration()
 
         // Start ONLY after commitConfiguration — calling startRunning
-        // between begin/commit throws NSGenericException and iOS kills
-        // the app (verified on device 2026-08-20, crash log 153502).
+        // between begin/commit throws NSGenericException (device crash 153502).
         session.startRunning()
+
+        // Pool for the combined 1080x1920 BGRA frames.
+        destPool = LiveCombine.makeBufferPool()
 
         configured = true
         DispatchQueue.main.async { self.ready = true }
@@ -174,32 +174,23 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         sessionQueue.async { [self] in
             guard phase == .ready else { return }
             do {
-                let back = try makeWriter(
-                    bitRate: 10_000_000, width: 1080, height: 1920, audio: true)
-                backWriter = back.writer
-                backVideoInput = back.video
-                backAudioInput = back.audio
-                backAdaptor = back.adaptor
-                backURL = back.url
-                let front = try makeWriter(
-                    bitRate: 5_000_000, width: 720, height: 1280, audio: false)
-                frontWriter = front.writer
-                frontVideoInput = front.video
-                frontAdaptor = front.adaptor
-                frontURL = front.url
+                let made = try makeWriter()
+                writer = made.writer
+                videoInput = made.video
+                audioInput = made.audio
+                adaptor = made.adaptor
+                outputURL = made.url
                 sessionStartTime = .invalid
-                backWriterStarted = false
-                frontWriterStarted = false
+                writerStarted = false
+                latestFront = nil
                 // Writers MUST enter .writing before startSession(atSourceTime:)
-                // is called in handle() — otherwise NSInternalInconsistencyException
-                // "Cannot call method when status is 0" (verified, crash 160528).
-                backWriter?.startWriting()
-                frontWriter?.startWriting()
+                // (device crash 160528: "Cannot call method when status is 0").
+                writer?.startWriting()
                 phase = .recording
                 publish(.recording)
                 startTimer()
             } catch {
-                teardownWriters(cancel: true)
+                teardownWriter(cancel: true)
                 phase = .ready
                 publish(.error("Could not start recording: \(error.localizedDescription)"))
             }
@@ -210,140 +201,129 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         sessionQueue.async { [self] in
             guard phase == .recording else { return }
             phase = .finishing
-            publish(.finishing)
             stopTimer()
-            backVideoInput?.markAsFinished()
-            frontVideoInput?.markAsFinished()
-            backAudioInput?.markAsFinished()
-            backWriter?.finishWriting { self.finishFrontThenComplete() }
-        }
-    }
-
-    private func finishFrontThenComplete() {
-        sessionQueue.async { [self] in
-            guard let front = frontWriter else { complete() ; return }
-            front.finishWriting {
+            videoInput?.markAsFinished()
+            audioInput?.markAsFinished()
+            writer?.finishWriting {
                 self.sessionQueue.async { self.complete() }
             }
         }
     }
 
     private func complete() {
-        let ok = backWriter?.status == .completed && frontWriter?.status == .completed
-        let urls = (front: frontURL, back: backURL)
-        teardownWriters(cancel: false)
+        let ok = writer?.status == .completed
+        let url = outputURL
+        teardownWriter(cancel: false)
         phase = .ready
-        if ok, let f = urls.front, let b = urls.back {
-            publish(.finished(front: f, back: b))
+        if ok, let url {
+            publish(.finished(url))
         } else {
             publish(.error("The recording could not be saved."))
         }
     }
 
-    // MARK: - Writers
+    // MARK: - Writer
 
-    private func makeWriter(
-        bitRate: Int, width: Int, height: Int, audio: Bool
-    ) throws -> (writer: AVAssetWriter, video: AVAssetWriterInput,
-                 audio: AVAssetWriterInput?, adaptor: AVAssetWriterInputPixelBufferAdaptor,
-                 url: URL) {
+    private func makeWriter() throws -> (writer: AVAssetWriter,
+                                         video: AVAssetWriterInput,
+                                         audio: AVAssetWriterInput,
+                                         adaptor: AVAssetWriterInputPixelBufferAdaptor,
+                                         url: URL) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
-        // Width/height are REQUIRED on iOS 18 AVFoundation — omitting them
-        // throws "Missing required key AVVideoHeightKey" (verified on device
-        // 2026-08-20, crash log 155017). Portrait dims match the rotated
-        // camera buffers we append.
+        // Width/height are REQUIRED on iOS 18 — omitting them throws
+        // "Missing required key AVVideoHeightKey" (device crash 155017).
         let video = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
+            AVVideoWidthKey: 1080,
+            AVVideoHeightKey: 1920,
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: bitRate,
+                AVVideoAverageBitRateKey: 10_000_000,
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
             ],
         ])
         video.expectsMediaDataInRealTime = true
-        writer.add(video)
+        w.add(video)
 
-        var audioInput: AVAssetWriterInput?
-        if audio {
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVNumberOfChannelsKey: 1,
-                AVSampleRateKey: 32_000,
-            ])
-            input.expectsMediaDataInRealTime = true
-            writer.add(input)
-            audioInput = input
-        }
+        let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVNumberOfChannelsKey: 1,
+            AVSampleRateKey: 32_000,
+        ])
+        audio.expectsMediaDataInRealTime = true
+        w.add(audio)
 
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        let ad = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: video, sourcePixelBufferAttributes: nil)
-        return (writer, video, audioInput, adaptor, url)
+        return (w, video, audio, ad, url)
     }
 
-    private func teardownWriters(cancel: Bool) {
+    private func teardownWriter(cancel: Bool) {
         if cancel {
-            backWriter?.cancelWriting()
-            frontWriter?.cancelWriting()
-            try? FileManager.default.removeItem(at: backURL!)
-            try? FileManager.default.removeItem(at: frontURL!)
+            writer?.cancelWriting()
+            if let url = outputURL {
+                try? FileManager.default.removeItem(at: url)
+            }
         }
-        backWriter = nil; frontWriter = nil
-        backVideoInput = nil; frontVideoInput = nil; backAudioInput = nil
-        backAdaptor = nil; frontAdaptor = nil
-        backURL = nil; frontURL = nil
-        backWriterStarted = false; frontWriterStarted = false
+        writer = nil; videoInput = nil; audioInput = nil; adaptor = nil
+        outputURL = nil
+        writerStarted = false
         sessionStartTime = .invalid
+        latestFront = nil
     }
 
     // MARK: - Sample handling (all on sessionQueue)
 
-    private func handle(_ sampleBuffer: CMSampleBuffer, isVideo: Bool, isBack: Bool) {
+    private func handleVideo(_ sampleBuffer: CMSampleBuffer, isBack: Bool) {
         guard phase == .recording else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        if isVideo {
-            if !sessionStartTime.isValid { sessionStartTime = pts }
+        if !isBack {
+            latestFront = pixelBuffer
+            return
         }
-        guard sessionStartTime.isValid, CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
 
-        if isVideo, isBack {
-            guard let writer = backWriter, let input = backVideoInput,
-                  let adaptor = backAdaptor else { return }
-            if !backWriterStarted {
-                writer.startSession(atSourceTime: sessionStartTime)
-                backWriterStarted = true
-            }
-            guard input.isReadyForMoreMediaData,
-                  let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-            if !adaptor.append(pixelBuffer, withPresentationTime: pts) {
-                fail("Could not write back-camera video.")
-            }
-        } else if isVideo {
-            guard let writer = frontWriter, let input = frontVideoInput,
-                  let adaptor = frontAdaptor else { return }
-            if !frontWriterStarted {
-                writer.startSession(atSourceTime: sessionStartTime)
-                frontWriterStarted = true
-            }
-            guard input.isReadyForMoreMediaData,
-                  let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-            if !adaptor.append(pixelBuffer, withPresentationTime: pts) {
-                fail("Could not write front-camera video.")
-            }
-        } else {
-            guard let writer = backWriter, let input = backAudioInput else { return }
-            if !backWriterStarted {
-                writer.startSession(atSourceTime: sessionStartTime)
-                backWriterStarted = true
-            }
-            guard input.isReadyForMoreMediaData else { return }
-            if !input.append(sampleBuffer) {
-                fail("Could not write audio.")
-            }
+        // Back frame = the clock. Composite + append.
+        guard let writer, let videoInput, let adaptor else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if !sessionStartTime.isValid { sessionStartTime = pts }
+        guard CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
+
+        guard videoInput.isReadyForMoreMediaData else { return }
+        guard let pool = destPool else { return }
+
+        var destMaybe: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &destMaybe)
+        guard let dest = destMaybe else { return }
+
+        CVPixelBufferLockBaseAddress(dest, [])
+        LiveCombine.draw(back: pixelBuffer, front: latestFront, dest: dest)
+        CVPixelBufferUnlockBaseAddress(dest, [])
+
+        if !writerStarted {
+            writer.startSession(atSourceTime: pts)
+            writerStarted = true
+        }
+        if !adaptor.append(dest, withPresentationTime: pts) {
+            fail("Could not write video.")
+        }
+    }
+
+    private func handleAudio(_ sampleBuffer: CMSampleBuffer) {
+        guard phase == .recording else { return }
+        guard let writer, let audioInput else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        guard sessionStartTime.isValid,
+              CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
+        if !writerStarted {
+            writer.startSession(atSourceTime: pts)
+            writerStarted = true
+        }
+        guard audioInput.isReadyForMoreMediaData else { return }
+        if !audioInput.append(sampleBuffer) {
+            fail("Could not write audio.")
         }
     }
 
@@ -372,7 +352,7 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
     /// Call on sessionQueue (or hop there first).
     private func fail(_ message: String) {
         stopTimer()
-        teardownWriters(cancel: true)
+        teardownWriter(cancel: true)
         phase = .ready
         publish(.error(message))
     }
@@ -393,8 +373,6 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
 }
 
 // MARK: - Capture delegates (thin forwarder onto sessionQueue)
-// One method satisfies BOTH protocols — the signatures are identical, so
-// separate declarations would be an invalid redeclaration.
 
 extension DualCamRecorder: AVCaptureVideoDataOutputSampleBufferDelegate,
                             AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -404,12 +382,12 @@ extension DualCamRecorder: AVCaptureVideoDataOutputSampleBufferDelegate,
     ) {
         if output === audioOutput {
             sessionQueue.async {
-                self.handle(sampleBuffer, isVideo: false, isBack: false)
+                self.handleAudio(sampleBuffer)
             }
         } else {
             let isBack = output === self.backVideoOutput
             sessionQueue.async {
-                self.handle(sampleBuffer, isVideo: true, isBack: isBack)
+                self.handleVideo(sampleBuffer, isBack: isBack)
             }
         }
     }

@@ -38,8 +38,7 @@ struct DualCamScreen: View {
         }
         .fullScreenCover(isPresented: $showFinish) {
             FinishScreen(
-                front: finishFront,
-                back: finishBack,
+                video: finishVideo,
                 onDone: {
                     showFinish = false
                     dismiss()
@@ -113,13 +112,8 @@ struct DualCamScreen: View {
         .padding(.bottom, 24)
     }
 
-    private var finishFront: URL? {
-        if case .finished(let front, _) = recorder.state { return front }
-        return nil
-    }
-
-    private var finishBack: URL? {
-        if case .finished(_, let back) = recorder.state { return back }
+    private var finishVideo: URL? {
+        if case .finished(let url) = recorder.state { return url }
         return nil
     }
 

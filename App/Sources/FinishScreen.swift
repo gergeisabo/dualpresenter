@@ -3,22 +3,14 @@ import Photos
 import SwiftUI
 import UIKit
 
-/// Post-recording flow: glue the two videos into one (Compositor), then let
-/// the user save to Photos or share. Cleans up temp files when done.
+/// Post-recording screen for the live-combined recording: the file already
+/// contains back camera + face bubble, so this is only save / share / done.
 struct FinishScreen: View {
-    let front: URL?
-    let back: URL?
+    let video: URL?
     let onDone: () -> Void
 
-    @State private var phase: Phase = .merging
-    @State private var progress: Double = 0
-    @State private var resultURL: URL?
-    @State private var errorMessage: String?
     @State private var shareItem: ShareItem?
-
-    enum Phase: Equatable {
-        case merging, done, failed
-    }
+    @State private var saved = false
 
     private struct ShareItem: Identifiable {
         let url: URL
@@ -30,7 +22,6 @@ struct FinishScreen: View {
             Color.black.ignoresSafeArea()
             content
         }
-        .onAppear { merge() }
         .sheet(item: $shareItem) { item in
             ShareSheet(urls: [item.url])
         }
@@ -38,26 +29,14 @@ struct FinishScreen: View {
 
     @ViewBuilder
     private var content: some View {
-        switch phase {
-        case .merging: mergingView
-        case .done: doneView
-        case .failed: failedView
-        }
-    }
-    private var mergingView: some View {
-        VStack(spacing: 16) {
-            ProgressView(value: progress)
-                .tint(.white)
-                .frame(maxWidth: 280)
-            Text("Gluing your videos...")
-                .foregroundStyle(.white)
-            Text("\(Int(progress * 100))%")
-                .font(.footnote.monospacedDigit())
-                .foregroundStyle(.gray)
+        if let video {
+            doneView(video)
+        } else {
+            failedView
         }
     }
 
-    private var doneView: some View {
+    private func doneView(_ url: URL) -> some View {
         VStack(spacing: 20) {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 56))
@@ -65,16 +44,15 @@ struct FinishScreen: View {
             Text("Your video is ready")
                 .font(.title2.bold())
                 .foregroundStyle(.white)
-            if let url = resultURL {
-                VideoThumb(url: url)
-                    .frame(height: 180)
-                    .cornerRadius(12)
-            }
-            Button("Save to Photos") { saveToPhotos() }
+            VideoThumb(url: url)
+                .frame(height: 220)
+                .cornerRadius(12)
+            Button(saved ? "Saved ✓" : "Save to Photos") { saveToPhotos(url) }
                 .buttonStyle(FinishButtonStyle())
-            Button("Share...") { shareItem = resultURL.map { ShareItem(url: $0) } }
+                .disabled(saved)
+            Button("Share...") { shareItem = ShareItem(url: url) }
                 .buttonStyle(FinishButtonStyle())
-            Button("Done") { cleanupThenDone() }
+            Button("Done") { cleanupThenDone(url) }
                 .buttonStyle(FinishButtonStyle(secondary: true))
         }
         .padding()
@@ -85,65 +63,34 @@ struct FinishScreen: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 56))
                 .foregroundStyle(.yellow)
-            Text("Merging failed")
+            Text("Recording failed")
                 .font(.title2.bold())
                 .foregroundStyle(.white)
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.footnote)
-                    .foregroundStyle(.gray)
-                    .multilineTextAlignment(.center)
-            }
             Button("Done") { onDone() }
                 .buttonStyle(FinishButtonStyle(secondary: true))
         }
         .padding()
     }
-    private func merge() {
-        guard let front, let back else {
-            phase = .failed
-            errorMessage = "The raw recordings are missing."
-            return
-        }
-        Task {
-            do {
-                let url = try await Compositor.composite(
-                    back: back, front: front, corner: .bottomRight
-                ) { value in
-                    Task { @MainActor in progress = value }
-                }
-                try? FileManager.default.removeItem(at: front)
-                try? FileManager.default.removeItem(at: back)
-                await MainActor.run {
-                    resultURL = url
-                    phase = .done
-                }
-            } catch {
-                await MainActor.run {
-                    errorMessage = error.localizedDescription
-                    phase = .failed
+
+    private func saveToPhotos(_ url: URL) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else { return }
+            PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+            } completionHandler: { ok, _ in
+                if ok {
+                    Task { @MainActor in saved = true }
                 }
             }
         }
     }
 
-    private func saveToPhotos() {
-        guard let url = resultURL else { return }
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            guard status == .authorized || status == .limited else { return }
-            PHPhotoLibrary.shared().performChanges {
-                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-            } completionHandler: { _, _ in }
-        }
-    }
-
-    private func cleanupThenDone() {
-        if let url = resultURL {
-            try? FileManager.default.removeItem(at: url)
-        }
+    private func cleanupThenDone(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
         onDone()
     }
 }
+
 // MARK: - Small helpers
 
 struct ShareSheet: UIViewControllerRepresentable {
