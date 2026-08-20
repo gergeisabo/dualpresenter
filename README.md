@@ -4,7 +4,7 @@ A minimal iOS presentation recorder: one app, two ways to capture. **Dual Cam** 
 
 ## Status
 
-M1: scaffold + builds green
+M1: complete — Dual Cam mode records front+back, composites to one video; build + 9 tests green on Xcode 26.3
 
 ## Build
 
