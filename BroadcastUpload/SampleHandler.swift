@@ -51,6 +51,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         switch sampleBufferType {
         case .video:
+            // App asked us to stop (user tapped Stop in the app).
+            if writer.pendingCommand == .stopRequested {
+                writer.setCommand(.ended)
+                self.writer = nil
+                finishBroadcastWithError(
+                    NSError(domain: "DualPresenter.BUE", code: 0))
+                return
+            }
             guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer)
             else { return }
             // The app consumes at most ~30 fps; screen capture delivers

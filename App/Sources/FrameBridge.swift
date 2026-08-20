@@ -257,6 +257,16 @@ enum FrameBridge {
             map.base.advanced(by: 24).storeBytes(of: command.rawValue, as: UInt32.self)
             map.unlock()
         }
+
+        /// App → extension: politely ask to end the broadcast.
+        func requestStop() {
+            setCommand(.stopRequested)
+        }
+
+        /// Extension side: what the app last asked for.
+        var pendingCommand: Command {
+            map.command
+        }
     }
 
     // MARK: - Reader (app side)
@@ -286,6 +296,15 @@ enum FrameBridge {
 
         init() throws {
             map = try Mapping(asWriter: false)
+        }
+
+        /// App → extension: ask to end the broadcast (same header word
+        /// the Writer's setCommand uses).
+        func requestStop() {
+            map.lock(exclusive: true)
+            map.base.advanced(by: 24).storeBytes(
+                of: Command.stopRequested.rawValue, as: UInt32.self)
+            map.unlock()
         }
 
         /// Returns the newest un-read video frame, or nil. Skips older

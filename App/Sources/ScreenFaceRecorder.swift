@@ -78,38 +78,64 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
 
     // MARK: - Broadcast picker
 
-    /// Presents the system broadcast picker. Call from the UI.
-    func pickAndStart() {
-        switch state {
-        case .idle, .error: break
-        default: return
+    /// Arms the watcher when the user is about to use the system broadcast
+    /// picker (RPSystemBroadcastPickerView shown by ScreenFaceScreen). We
+    /// can't present the picker ourselves on this OS — load() reports
+    /// "service not found" — so we watch for the extension's first frames.
+    func requestBroadcast() {
+        beginArmWatch()
+    }
+
+    private var armWatchSource: DispatchSourceTimer?
+    private var armReader: FrameBridge.Reader?
+    private var armBaseSeq: UInt64 = 0
+
+    private func beginArmWatch() {
+        bridgeQueue.async { [self] in
+            guard armWatchSource == nil else { return }
+            armReader = try? FrameBridge.Reader()
+            // Baseline: if a stale bridge file exists from an earlier
+            // session, its seq must not arm us. A fresh broadcast
+            // rewrites the file and the seq moves off the baseline.
+            armBaseSeq = armReader?.map.magicOK == true
+                ? armReader!.map.videoWriteSeq : 0
+            let source = DispatchSource.makeTimerSource(queue: bridgeQueue)
+            source.schedule(deadline: .now() + 0.5, repeating: .seconds(1))
+            source.setEventHandler { [weak self] in
+                self?.armWatchTick()
+            }
+            source.resume()
+            armWatchSource = source
         }
-        publish(.picking)
-        let bundleID = Bundle.main.bundleIdentifier ?? ""
-        RPBroadcastActivityViewController.load(
-            withPreferredExtension: "\(bundleID).BroadcastUpload"
-        ) { [weak self] viewController, error in
-            guard let self else { return }
-            guard let viewController else {
-                self.publish(.error(
-                    "Could not open the broadcast picker: \(error?.localizedDescription ?? "unknown error")"))
-                return
-            }
-            viewController.delegate = self
-            DispatchQueue.main.async {
-                // Present from the TOP-MOST controller. ScreenFaceScreen is
-                // itself a full-screen cover over the root — presenting
-                // from root while a cover is up is silently ignored.
-                let base = UIApplication.shared.connectedScenes
-                    .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-                    .compactMap { $0.rootViewController }
-                    .first
-                var top = base
-                while let presented = top?.presentedViewController {
-                    top = presented
-                }
-                top?.present(viewController, animated: true)
-            }
+    }
+
+    private func armWatchTick() {
+        if armReader == nil {
+            armReader = try? FrameBridge.Reader()
+            if armReader == nil { return }
+            armBaseSeq = armReader!.map.magicOK
+                ? armReader!.map.videoWriteSeq : 0
+        }
+        guard let live = armReader, live.map.magicOK else { return }
+        let seq = live.map.videoWriteSeq
+        guard seq > 0, seq != armBaseSeq else { return }
+        // Frames flowing — the user tapped Start Broadcast. Hand over.
+        armReader = nil
+        armWatchSource?.cancel()
+        armWatchSource = nil
+        reader = live
+        sessionQueue.async { [self] in
+            configureFaceIfNeeded()
+            phase = .armed
+            publish(.armed)
+        }
+    }
+
+    private func stopArmWatch() {
+        bridgeQueue.async { [self] in
+            armWatchSource?.cancel()
+            armWatchSource = nil
+            armReader = nil
         }
     }
 
@@ -251,9 +277,11 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         }
     }
 
+    /// Asks the extension to end the broadcast (bridge stop command).
+    /// Called after the file is safely finished. The user can also stop
+    /// via the red pill / Control Center — pollBridge sees .ended.
     private func endBroadcast() {
-        broadcastController?.finishBroadcast { _ in }
-        broadcastController = nil
+        reader?.requestStop()
     }
 
     private func complete() {
@@ -261,6 +289,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         let url = outputURL
         teardownWriter(cancel: false)
         endBroadcast()
+        stopArmWatch()
         phase = .idle
         reader = nil
         if ok, let url {

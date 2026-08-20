@@ -1,4 +1,5 @@
 import AVFoundation
+import ReplayKit
 import SwiftUI
 import UIKit
 
@@ -31,6 +32,11 @@ struct ScreenFaceScreen: View {
                 if recorder.state == .armed { startControls }
                 if recorder.state == .recording { recordingControls }
             }
+        }
+        .onAppear {
+            // Watch for the user starting a broadcast via the system
+            // picker at any time while this screen is up.
+            recorder.requestBroadcast()
         }
         .onDisappear { recorder.stopRecording() }
         .onChange(of: placement) { _, new in
@@ -65,16 +71,11 @@ struct ScreenFaceScreen: View {
                 .foregroundStyle(.white.opacity(0.75))
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 32)
-            Button {
-                recorder.pickAndStart()
-            } label: {
-                Label("Choose Screen Recording", systemImage: "broadcast")
-                    .font(.headline)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 14)
-                    .background(.white.opacity(0.15), in: Capsule())
-                    .foregroundStyle(.white)
-            }
+            SystemBroadcastPickerButton(
+                extensionID: Bundle.main.bundleIdentifier.map { "\($0).BroadcastUpload" },
+                onTap: { recorder.requestBroadcast() }
+            )
+            .frame(maxWidth: 220)
             .disabled(recorder.state == .picking)
         }
     }
@@ -197,6 +198,42 @@ struct ScreenFaceScreen: View {
     private func elapsedText(_ t: TimeInterval) -> String {
         let s = Int(t)
         return String(format: "%02d:%02d", s / 60, s % 60)
+    }
+}
+
+/// Apple's own broadcast-start button (RPSystemBroadcastPickerView). On
+/// iOS 18 this is the supported trigger — it lists registered broadcast
+/// extensions; if ours isn't listed, iOS refuses to preselect it.
+struct SystemBroadcastPickerButton: View {
+    let extensionID: String?
+    var onTap: () -> Void = {}
+
+    var body: some View {
+        Represented(extensionID: extensionID, onTap: onTap)
+            .frame(height: 54)
+            .frame(maxWidth: .infinity)
+            .background(.white.opacity(0.15), in: Capsule())
+            .overlay(alignment: .leading) {
+                Label("Choose Screen Recording", systemImage: "broadcast")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .padding(.leading, 24)
+                    .allowsHitTesting(false)
+            }
+    }
+
+    struct Represented: UIViewRepresentable {
+        let extensionID: String?
+        var onTap: () -> Void = {}
+
+        func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
+            let picker = RPSystemBroadcastPickerView()
+            picker.preferredExtension = extensionID
+            picker.showsMicrophoneButton = true
+            return picker
+        }
+
+        func updateUIView(_ uiView: RPSystemBroadcastPickerView, context: Context) {}
     }
 }
 
