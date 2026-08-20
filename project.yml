@@ -13,11 +13,8 @@ targets:
     platform: iOS
     sources:
       - App/Sources
-    settings:
-      base:
-        CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: YOUR_TEAM_ID
-        TARGETED_DEVICE_FAMILY: "1"
+    dependencies:
+      - target: BroadcastUpload
     info:
       path: App/Info.plist
       properties:
@@ -26,6 +23,46 @@ targets:
         NSCameraUsageDescription: DualPresenter records the back camera view of the content you present.
         NSMicrophoneUsageDescription: DualPresenter records your voice together with the presentation.
         NSPhotoLibraryAddUsageDescription: DualPresenter saves finished videos to your photo library.
+    entitlements:
+      path: App/DualPresenter.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.gergeisabo.dualpresenter
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: YOUR_TEAM_ID
+        TARGETED_DEVICE_FAMILY: "1"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+  BroadcastUpload:
+    type: app-extension
+    platform: iOS
+    sources:
+      - BroadcastUpload
+      - path: App/Sources/FrameBridge.swift
+    dependencies:
+      - sdk: ReplayKit.framework
+      - sdk: CoreMedia.framework
+    info:
+      path: BroadcastUpload/Info.plist
+      properties:
+        CFBundleDisplayName: BroadcastUpload
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.broadcast-services-upload
+          RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SampleHandler
+    entitlements:
+      path: BroadcastUpload/BroadcastUpload.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.gergeisabo.dualpresenter
+    settings:
+      base:
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: YOUR_TEAM_ID
+        TARGETED_DEVICE_FAMILY: "1"
+        PRODUCT_BUNDLE_IDENTIFIER: com.gergeisabo.DualPresenter.BroadcastUpload
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
   DualPresenterTests:
     type: bundle.unit-test
     platform: iOS
