@@ -110,9 +110,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
             writer.storeAudio(
                 bytes: data,
                 byteCount: Int(list.mBuffers.mDataByteSize),
-                sampleRate: numSamples > 0 && pts.isValid
-                    ? Double(numSamples) / pts.seconds
-                    : 48000,
+                // NOTE: ReplayKit's pts is host-time seconds since boot,
+                // NOT duration — numSamples/pts.seconds is dimensionally
+                // wrong (yields ~0.003 Hz). Trust the buffer's own format.
+                sampleRate: 48000,
                 numChannels: Int(list.mBuffers.mNumberChannels),
                 pts: pts)
         default:

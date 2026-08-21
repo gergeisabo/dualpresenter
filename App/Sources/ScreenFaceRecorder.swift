@@ -57,6 +57,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var outputURL: URL?
     private var writerStarted = false
+    private var lastVideoPTS: CMTime?
     private var sessionStartTime: CMTime = .invalid
     private var phase: Phase = .idle
     enum Phase { case idle, armed, recording, finishing }
@@ -112,6 +113,12 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     }
 
     private func armWatchTick() {
+        // Re-arm protection: if we are already recording, a new frame
+        // burst (broadcast picker re-tapped, extension restart after the
+        // orphan guard killed it) must NOT create a second writer.
+        if phase == .recording || phase == .finishing {
+            return
+        }
         if armReader == nil {
             armReader = try? FrameBridge.Reader()
             if armReader == nil { return }
@@ -245,6 +252,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
                 outputURL = made.url
                 sessionStartTime = .invalid
                 writerStarted = false
+                lastVideoPTS = nil
                 latestFace = nil
                 audioConverter = nil
                 audioOutputFormat = nil
@@ -365,7 +373,14 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
 
         let pts = frame.pts
         if !sessionStartTime.isValid { sessionStartTime = pts }
+        // PTS monotonicity: AVAssetWriter demands strictly increasing
+        // timestamps; pollVideo grabs the NEWEST frame each 10ms tick, so
+        // duplicates/regressions are normal — drop the frame, keep recording.
         guard CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
+        if let last = lastVideoPTS, CMTimeCompare(pts, last) <= 0 {
+            return  // duplicate/regressed frame — skip, keep recording
+        }
+        lastVideoPTS = pts
 
         guard let pool = destPool else { return }
         var destMaybe: CVPixelBuffer?
@@ -601,6 +616,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         writer = nil; videoInput = nil; audioInput = nil; adaptor = nil
         outputURL = nil
         writerStarted = false
+        lastVideoPTS = nil
         sessionStartTime = .invalid
         latestFace = nil
         audioConverter = nil
