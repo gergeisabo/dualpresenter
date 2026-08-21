@@ -66,6 +66,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     // ONLY (single dedicated queue — no cross-queue access).
     private var reader: FrameBridge.Reader?
     private var pollSource: DispatchSourceTimer?
+    private var heartbeatSource: DispatchSourceTimer?
 
     // PiP facecam
     private var pipController: AVPictureInPictureController?
@@ -117,6 +118,9 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
                 ? armReader!.map.videoWriteSeq : 0
         }
         guard let live = armReader, live.map.magicOK else { return }
+        // Keep the extension's orphan guard fed during the pre-record
+        // window (frames flowing, auto-record not yet fired).
+        live.stampHeartbeat()
         let seq = live.map.videoWriteSeq
         guard seq > 0, seq != armBaseSeq else { return }
         // Frames flowing — the user tapped Start Broadcast. Hand over.
@@ -128,6 +132,9 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             configureFaceIfNeeded()
             phase = .armed
             publish(.armed)
+            // ONE user action: broadcast live ⇒ recording starts by
+            // itself. No second "start recording" step.
+            startRecording()
         }
     }
 
@@ -310,11 +317,22 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         source.setEventHandler { [weak self] in self?.pollBridge() }
         source.resume()
         pollSource = source
+        // Beat ~4x/sec so the extension's 5s staleness guard never fires
+        // while the app is alive (recording or armed-idle).
+        let beat = DispatchSource.makeTimerSource(queue: bridgeQueue)
+        beat.schedule(deadline: .now(), repeating: .milliseconds(250))
+        beat.setEventHandler { [weak self] in
+            self?.reader?.stampHeartbeat()
+        }
+        beat.resume()
+        heartbeatSource = beat
     }
 
     private func stopPolling() {
         pollSource?.cancel()
         pollSource = nil
+        heartbeatSource?.cancel()
+        heartbeatSource = nil
     }
 
     private func pollBridge() {

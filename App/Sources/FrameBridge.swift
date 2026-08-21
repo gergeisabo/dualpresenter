@@ -267,6 +267,18 @@ enum FrameBridge {
         var pendingCommand: Command {
             map.command
         }
+
+        /// Extension side: seconds since the app last stamped its
+        /// heartbeat. `stamped == 0` means the app hasn't stamped YET —
+        /// treat as fresh (launch grace); the handler bounds it with its
+        /// own since-start clock.
+        var appHeartbeatAge: TimeInterval {
+            map.lock(exclusive: false)
+            let stamped = map.base.advanced(by: 28).load(as: UInt32.self)
+            map.unlock()
+            guard stamped > 0 else { return 0 }
+            return Date().timeIntervalSince1970 - Double(stamped)
+        }
     }
 
     // MARK: - Reader (app side)
@@ -304,6 +316,16 @@ enum FrameBridge {
             map.lock(exclusive: true)
             map.base.advanced(by: 24).storeBytes(
                 of: Command.stopRequested.rawValue, as: UInt32.self)
+            map.unlock()
+        }
+
+        /// App liveness stamp (offset 28, epoch seconds). The extension
+        /// ends the broadcast by itself if this goes stale — an app crash
+        /// can never orphan a running broadcast again.
+        func stampHeartbeat() {
+            let now = UInt32(Date().timeIntervalSince1970)
+            map.lock(exclusive: true)
+            map.base.advanced(by: 28).storeBytes(of: now, as: UInt32.self)
             map.unlock()
         }
 
@@ -359,10 +381,18 @@ enum FrameBridge {
                     continue
                 }
                 let pts = map.base.advanced(by: metaOffset + 8).load(as: PTS.self)
-                let byteCount = Int(map.base.advanced(by: metaOffset + 32)
+                var byteCount = Int(map.base.advanced(by: metaOffset + 32)
                     .load(as: UInt32.self))
+                guard byteCount > 0, byteCount <= audioSlotBytes else {
+                    lastAudioSeq += 1   // torn/garbage meta: skip
+                    continue
+                }
+                byteCount = min(byteCount, audioSlotBytes)
+                // +44 is NOT 8-byte aligned (184 + slot*104 + 44 ≡ 4 mod 8);
+                // load(as: Double.self) TRAPS on misalignment (crash
+                // 2026-08-21-122529). loadUnaligned is the sanctioned read.
                 let sampleRate = map.base.advanced(by: metaOffset + 44)
-                    .load(as: Double.self)
+                    .loadUnaligned(as: Double.self)
                 let channels = max(1, Int(map.base.advanced(by: metaOffset + 52)
                     .load(as: UInt32.self)))
                 let data = Data(bytes: map.base + audioDataOffset

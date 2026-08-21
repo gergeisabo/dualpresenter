@@ -14,8 +14,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private var writer: FrameBridge.Writer?
     private var dropped = 0
+    private var startedAt = Date()
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        startedAt = Date()
         do {
             let w = try FrameBridge.Writer()
             // Fresh session: reset the ring header (seq = 0) and mark
@@ -46,6 +48,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard let writer else { return }
         guard sampleBufferType == .video || sampleBufferType == .audioMic
         else { return }
+
+        // Orphan guard: if the app died (crash/kill), its heartbeat goes
+        // stale and WE end the broadcast ourselves — no zombie recording.
+        // Grace: 10s from broadcast start covers app cold-start + camera
+        // permission + writer setup before the first stamp lands.
+        if writer.appHeartbeatAge > 5,
+           Date().timeIntervalSince(startedAt) > 10 {
+            writer.setCommand(.ended)
+            self.writer = nil
+            finishBroadcastWithError(
+                NSError(domain: "DualPresenter.BUE", code: 0))
+            return
+        }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
