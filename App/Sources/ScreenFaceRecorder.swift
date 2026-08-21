@@ -2,6 +2,7 @@ import AVFoundation
 import AVKit
 import Combine
 import CoreMedia
+import os
 import ReplayKit
 import UIKit
 
@@ -382,7 +383,11 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             writerStarted = true
         }
         if !adaptor.append(dest, withPresentationTime: pts) {
-            fail("Could not write video.")
+            let nsErr = writer.error.map { "\($0.localizedDescription) (\(($0 as NSError).code))" }
+                ?? "unknown"
+            os_log(.error, "DP appendVideo fail: pts=%@ status=%@ err=%@",
+                   "\(pts)", "\(writer.status)", nsErr)
+            fail("Could not write video [\(nsErr)].")
         }
     }
 
@@ -462,7 +467,9 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             return inBuf
         }
         if let conversionError {
-            fail("Audio conversion failed.")
+            os_log(.error, "DP audio convert fail: %@",
+                   conversionError.localizedDescription)
+            fail("Audio conversion failed [\(conversionError.localizedDescription)].")
             return
         }
         guard outBuf.frameLength > 0,
@@ -475,7 +482,10 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             writerStarted = true
         }
         if !audioInput.append(sample) {
-            fail("Could not write audio.")
+            let nsErr = writer?.error.map { "\($0.localizedDescription) (\(($0 as NSError).code))" }
+                ?? "unknown"
+            os_log(.error, "DP appendAudio fail: err=%@", nsErr)
+            fail("Could not write audio [\(nsErr)].")
         }
     }
 
@@ -637,14 +647,20 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     }
 
     private func stopPiP() {
-        pipController?.stopPictureInPicture()
+        // UIKit + FrontBoard require main-thread for window/layer teardown
+        // (crash 2026-08-21-141441: UIWindow._setHidden off-main → SIGTRAP).
+        let controller = pipController
+        let layer = pipDisplayLayer
         pipController = nil
-        pipDisplayLayer?.flush()
         pipDisplayLayer = nil
-        pipHost?.removeFromSuperview()
-        pipHost = nil
-        pipWindow?.isHidden = true
-        pipWindow = nil
+        DispatchQueue.main.async { [weak self] in
+            controller?.stopPictureInPicture()
+            layer?.flush()
+            self?.pipHost?.removeFromSuperview()
+            self?.pipHost = nil
+            self?.pipWindow?.isHidden = true
+            self?.pipWindow = nil
+        }
     }
 
     /// Called on videoQueue with the latest face frame: feeds both the
