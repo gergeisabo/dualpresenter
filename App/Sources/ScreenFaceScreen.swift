@@ -207,29 +207,53 @@ struct ScreenFaceScreen: View {
 struct SystemBroadcastPickerButton: View {
     let extensionID: String?
     var onTap: () -> Void = {}
+    @State private var proxy = PickerProxy()
 
     var body: some View {
-        Represented(extensionID: extensionID, onTap: onTap)
-            .frame(height: 54)
-            .frame(maxWidth: .infinity)
-            .background(.white.opacity(0.15), in: Capsule())
-            .overlay(alignment: .leading) {
+        ZStack {
+            // Apple's real button, hidden from view but alive so we can
+            // programmatically press it.
+            Represented(extensionID: extensionID, proxy: proxy)
+                .frame(width: 1, height: 1)
+                .opacity(0.001)
+            Button {
+                onTap()
+                // Press Apple's hidden button → iOS shows the real sheet.
+                proxy.press()
+            } label: {
                 Label("Choose Screen Recording", systemImage: "broadcast")
                     .font(.headline)
                     .foregroundStyle(.white)
-                    .padding(.leading, 24)
-                    .allowsHitTesting(false)
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 14)
+                    .frame(maxWidth: .infinity)
+                    .background(.white.opacity(0.15), in: Capsule())
             }
+        }
+    }
+
+    /// Holds a weak reference to Apple's real button so the big styled
+    /// button can programmatically press it.
+    @MainActor
+    final class PickerProxy {
+        weak var button: RPSystemBroadcastPickerView?
+        func press() {
+            guard let button else { return }
+            for case let sub as UIButton in button.subviews {
+                sub.sendActions(for: .touchUpInside)
+            }
+        }
     }
 
     struct Represented: UIViewRepresentable {
         let extensionID: String?
-        var onTap: () -> Void = {}
+        var proxy: PickerProxy
 
         func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
             let picker = RPSystemBroadcastPickerView()
             picker.preferredExtension = extensionID
             picker.showsMicrophoneButton = true
+            proxy.button = picker
             return picker
         }
 
