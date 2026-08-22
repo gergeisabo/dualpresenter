@@ -303,7 +303,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         DispatchQueue.main.async {
             let c = RPBroadcastController()
             guard c.isBroadcasting else { return }
-            c.stopBroadcast { _ in }
+            c.finishBroadcast { _ in }
         }
     }
 
