@@ -177,6 +177,8 @@ enum FrameBridge {
         /// into the next 1080x1920 BGRA slot. Returns the slot index to
         /// pass to `commitVideoFrame`, or nil if drawing failed.
         func beginVideoFrame(from buffer: CVPixelBuffer) -> Int? {
+            map.lock(exclusive: true)
+            defer { map.unlock() }
             let index = Int(map.videoWriteSeq % UInt64(videoSlotCount))
             let slotPtr = map.base + videoDataOffset + index * videoSlotBytes
             guard let ctx = CGContext(
@@ -356,11 +358,15 @@ enum FrameBridge {
                                 kCVPixelFormatType_32BGRA, nil, &buf)
             guard let buf else { return nil }
             CVPixelBufferLockBaseAddress(buf, [])
-            if let dst = CVPixelBufferGetBaseAddress(buf) {
-                let src = map.base + videoDataOffset + slot * videoSlotBytes
-                memcpy(dst, src, videoSlotBytes)
+            defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+            guard let dst = CVPixelBufferGetBaseAddress(buf) else { return nil }
+            let dstBPR = CVPixelBufferGetBytesPerRow(buf)
+            let srcBPR = 1080 * 4
+            let src = map.base + videoDataOffset + slot * videoSlotBytes
+            let rowBytes = min(dstBPR, srcBPR)
+            for y in 0..<1920 {
+                memcpy(dst + y * dstBPR, src + y * srcBPR, rowBytes)
             }
-            CVPixelBufferUnlockBaseAddress(buf, [])
             return VideoFrame(
                 seq: newest, pts: pts.cmTime, pixelBuffer: buf)
         }
