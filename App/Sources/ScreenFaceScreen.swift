@@ -18,8 +18,10 @@ struct ScreenFaceScreen: View {
             switch recorder.state {
             case .idle, .picking:
                 idleView
-            case .armed, .recording:
-                armedView
+            case .armed:
+                startingView
+            case .recording:
+                recordingView
             case .finished:
                 Color.black
             case .error(let message):
@@ -33,11 +35,9 @@ struct ScreenFaceScreen: View {
             }
         }
         .onAppear {
-            // Watch for the user starting a broadcast via the system
-            // picker at any time while this screen is up.
             recorder.requestBroadcast()
         }
-        .onDisappear { recorder.stopRecording() }
+        // Don't stop on disappear — going Home must keep recording.
         .onChange(of: placement) { _, new in
             recorder.bubblePlacement = new
         }
@@ -79,21 +79,25 @@ struct ScreenFaceScreen: View {
         }
     }
 
-    private var armedView: some View {
-        ZStack {
-            // Live mirror of what the recording will look like: the face
-            // bubble over a placeholder (the screen itself is being
-            // captured system-wide).
-            ScreenFaceBubble(
-                recorder: recorder,
-                placement: $placement,
-                bubbleSize: 110
-            )
-            if recorder.state == .armed {
-                Text("Starting…")
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.8))
+    private var startingView: some View {
+        Text("Starting…")
+            .font(.footnote)
+            .foregroundStyle(.white.opacity(0.8))
+    }
+
+    private var recordingView: some View {
+        VStack(spacing: 18) {
+            HStack(spacing: 8) {
+                Circle().fill(.red).frame(width: 12, height: 12)
+                Text(elapsedText(recorder.elapsed))
+                    .font(.system(size: 28, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
             }
+            Text("Recording. Tap your face bubble to come back here.")
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.75))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 28)
         }
     }
 
@@ -116,7 +120,11 @@ struct ScreenFaceScreen: View {
     private var header: some View {
         HStack {
             Button {
-                dismiss()
+                if recorder.state == .recording {
+                    recorder.stopRecording()
+                } else {
+                    dismiss()
+                }
             } label: {
                 Image(systemName: "xmark")
                     .font(.title3.bold())
@@ -145,10 +153,9 @@ struct ScreenFaceScreen: View {
 
     private var recordingControls: some View {
         VStack(spacing: 10) {
-            Text("Recording the screen + your face.\nPresent in any app — come back here to stop.")
+            Text("Tap Stop when you are done.")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.85))
-                .multilineTextAlignment(.center)
             Button {
                 recorder.stopRecording()
             } label: {

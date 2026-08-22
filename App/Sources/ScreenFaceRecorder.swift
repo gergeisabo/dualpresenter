@@ -269,7 +269,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
                 publish(.recording)
                 startTimer()
                 startPolling()
-                DispatchQueue.main.async { self.preparePiP() }
+                DispatchQueue.main.async { self.preparePiPAndLeave() }
             } catch {
                 teardownWriter(cancel: true)
                 phase = .armed
@@ -653,8 +653,19 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     private var pipObservers: [NSObjectProtocol] = []
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
 
-    /// Build video-call PiP (face only, no play/skip chrome). Do NOT start
-    /// it here — starting in DualPresenter shows a player of the app.
+    private func preparePiPAndLeave() {
+        preparePiP()
+        pipController?.startPictureInPicture()
+        // Give the first face frames a moment, then go Home so the
+        // recording is the user's other apps — not this black screen.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard self?.phase == .recording else { return }
+            UIControl().sendAction(
+                #selector(URLSessionTask.suspend),
+                to: UIApplication.shared,
+                for: nil)
+        }
+    }
     private func preparePiP() {
         guard pipController == nil else { return }
         guard AVPictureInPictureController.isPictureInPictureSupported()
@@ -690,6 +701,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             contentViewController: callVC)
         let controller = AVPictureInPictureController(contentSource: source)
         controller.canStartPictureInPictureAutomaticallyFromInline = true
+        controller.delegate = self
         pipController = controller
 
         let nc = NotificationCenter.default
@@ -872,6 +884,16 @@ extension ScreenFaceRecorder: RPBroadcastActivityViewControllerDelegate,
         DispatchQueue.main.async { [weak self] in
             self?.finishNow()
         }
+    }
+}
+
+extension ScreenFaceRecorder: AVPictureInPictureControllerDelegate {
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        completionHandler(true)
     }
 }
 
