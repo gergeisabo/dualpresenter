@@ -15,6 +15,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var writer: FrameBridge.Writer?
     private var dropped = 0
     private var startedAt = Date()
+    private var pendingApp = [Int16]()
+    private var pendingMic = [Int16]()
+    private var mixPTS = CMTime.invalid
+    private let mixRate = 44_100.0
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         startedAt = Date()
@@ -36,9 +40,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
     override func broadcastResumed() {}
 
     override func broadcastFinished() {
-        writer?.setCommand(.ended)
+        if let writer {
+            flushAudio(writer, force: true)
+            writer.setCommand(.ended)
+        }
         writer = nil
-        // Keep the ring readable so the app can drain the tail.
+        pendingApp.removeAll()
+        pendingMic.removeAll()
     }
 
     override func processSampleBuffer(
@@ -87,90 +95,141 @@ final class SampleHandler: RPBroadcastSampleHandler {
             else { return }
             writer.commitVideoFrame(slot: slot, pts: pts)
         case .audioMic, .audioApp:
-            storeAudio(sampleBuffer, writer: writer, pts: pts)
+            ingestAudio(sampleBuffer, isMic: sampleBufferType == .audioMic, writer: writer, pts: pts)
         default:
             break
         }
     }
 
-    /// ReplayKit may deliver Float32 or Int16. Always store packed Int16
-    /// so the app-side writer has a known format. Uses the buffer's own
-    /// sample rate (not a hardcoded 48000).
-    private func storeAudio(
+    /// Decode ReplayKit audio (float or int, any rate/channel count) to
+    /// 44.1 kHz mono Int16, mix mic + app, write in 8 KB ring slots.
+    private func ingestAudio(
         _ sampleBuffer: CMSampleBuffer,
+        isMic: Bool,
         writer: FrameBridge.Writer,
         pts: CMTime
     ) {
-        let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
-        guard numSamples > 0 else { return }
+        guard let pcm = decodeToMonoInt16(sampleBuffer) else { return }
+        if !mixPTS.isValid { mixPTS = pts }
+        if isMic { pendingMic.append(contentsOf: pcm) }
+        else { pendingApp.append(contentsOf: pcm) }
+        flushAudio(writer, force: false)
+    }
 
-        var rate = 44_100.0
-        var channels = 1
-        var isFloat = false
-        if let fmt = CMSampleBufferGetFormatDescription(sampleBuffer),
-           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee {
-            if asbd.mSampleRate > 0 { rate = asbd.mSampleRate }
-            channels = max(1, Int(asbd.mChannelsPerFrame))
-            isFloat = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0
+    private func flushAudio(_ writer: FrameBridge.Writer, force: Bool) {
+        let hold = Int(mixRate * 0.02)
+        while true {
+            let nMix = min(pendingApp.count, pendingMic.count)
+            if nMix > 0 {
+                var mixed = [Int16](repeating: 0, count: nMix)
+                for i in 0..<nMix {
+                    let s = Int(pendingApp[i]) + Int(pendingMic[i])
+                    mixed[i] = Int16(clamping: s)
+                }
+                pendingApp.removeFirst(nMix)
+                pendingMic.removeFirst(nMix)
+                writePCM(mixed, writer: writer)
+                continue
+            }
+            let alone = pendingMic.isEmpty ? pendingApp : pendingApp.isEmpty ? pendingMic : [Int16]()
+            if alone.isEmpty { break }
+            if !force && alone.count <= hold { break }
+            writePCM(alone, writer: writer)
+            if pendingMic.isEmpty { pendingApp.removeAll() }
+            else { pendingMic.removeAll() }
+            break
         }
+    }
 
-        var listSize: Int = 0
+    private func writePCM(_ pcm: [Int16], writer: FrameBridge.Writer) {
+        guard !pcm.isEmpty else { return }
+        let maxSamples = FrameBridge.audioSlotBytes / 2
+        var offset = 0
+        var t = mixPTS
+        while offset < pcm.count {
+            let n = min(maxSamples, pcm.count - offset)
+            pcm.withUnsafeBufferPointer { buf in
+                writer.storeAudio(
+                    bytes: buf.baseAddress! + offset,
+                    byteCount: n * 2,
+                    sampleRate: mixRate,
+                    numChannels: 1,
+                    pts: t)
+            }
+            offset += n
+            t = t + CMTime(value: CMTimeValue(n), timescale: CMTimeScale(mixRate))
+        }
+        mixPTS = t
+    }
+
+    private func decodeToMonoInt16(_ sampleBuffer: CMSampleBuffer) -> [Int16]? {
+        guard let fmt = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee
+        else { return nil }
+        let rate = asbd.mSampleRate > 0 ? asbd.mSampleRate : mixRate
+        let ch = max(1, Int(asbd.mChannelsPerFrame))
+        let bytesPerFrame = max(1, Int(asbd.mBytesPerFrame))
+        let isFloat = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0
+
+        var listSize = 0
         CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: &listSize,
-            bufferListOut: nil,
-            bufferListSize: 0,
+            sampleBuffer, bufferListSizeNeededOut: &listSize,
+            bufferListOut: nil, bufferListSize: 0,
             blockBufferAllocator: kCFAllocatorDefault,
             blockBufferMemoryAllocator: kCFAllocatorDefault,
-            flags: 0,
-            blockBufferOut: nil)
-        guard listSize > 0 else { return }
+            flags: 0, blockBufferOut: nil)
+        guard listSize > 0 else { return nil }
         let raw = UnsafeMutableRawPointer.allocate(
             byteCount: listSize, alignment: MemoryLayout<AudioBufferList>.alignment)
         defer { raw.deallocate() }
         let abl = raw.assumingMemoryBound(to: AudioBufferList.self)
         var block: CMBlockBuffer?
         let st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: abl,
-            bufferListSize: listSize,
+            sampleBuffer, bufferListSizeNeededOut: nil,
+            bufferListOut: abl, bufferListSize: listSize,
             blockBufferAllocator: kCFAllocatorDefault,
             blockBufferMemoryAllocator: kCFAllocatorDefault,
-            flags: 0,
-            blockBufferOut: &block)
-        guard st == noErr else { return }
+            flags: 0, blockBufferOut: &block)
+        guard st == noErr else { return nil }
         let buf = abl.pointee.mBuffers
-        guard buf.mDataByteSize > 0, let data = buf.mData else { return }
-        let inChannels = max(1, Int(buf.mNumberChannels == 0 ? channels : Int(buf.mNumberChannels)))
+        guard buf.mDataByteSize > 0, let data = buf.mData else { return nil }
+        let frames = Int(buf.mDataByteSize) / bytesPerFrame
+        guard frames > 0 else { return nil }
 
-        // Downmix to mono Int16 for the ring.
-        var pcm = [Int16](repeating: 0, count: numSamples)
+        var mono = [Int16](repeating: 0, count: frames)
         if isFloat {
             let src = data.assumingMemoryBound(to: Float.self)
-            for i in 0..<numSamples {
+            for i in 0..<frames {
                 var acc: Float = 0
-                for c in 0..<inChannels { acc += src[i * inChannels + c] }
-                acc /= Float(inChannels)
-                let clipped = max(-1, min(1, acc))
-                pcm[i] = Int16(clipped * Float(Int16.max))
+                for c in 0..<ch { acc += src[i * ch + c] }
+                acc /= Float(ch)
+                mono[i] = Int16(max(-1, min(1, acc)) * Float(Int16.max))
             }
         } else {
             let src = data.assumingMemoryBound(to: Int16.self)
-            for i in 0..<numSamples {
+            for i in 0..<frames {
                 var acc = 0
-                for c in 0..<inChannels { acc += Int(src[i * inChannels + c]) }
-                pcm[i] = Int16(acc / inChannels)
+                for c in 0..<ch { acc += Int(src[i * ch + c]) }
+                mono[i] = Int16(acc / ch)
             }
         }
-        pcm.withUnsafeBytes { raw in
-            guard let ptr = raw.baseAddress else { return }
-            writer.storeAudio(
-                bytes: ptr,
-                byteCount: pcm.count * 2,
-                sampleRate: rate,
-                numChannels: 1,
-                pts: pts)
+        if abs(rate - mixRate) < 1 { return mono }
+        return resample(mono, from: rate, to: mixRate)
+    }
+
+    private func resample(_ input: [Int16], from: Double, to: Double) -> [Int16] {
+        guard !input.isEmpty, from > 0 else { return input }
+        let outCount = max(1, Int((Double(input.count) * to / from).rounded()))
+        var out = [Int16](repeating: 0, count: outCount)
+        let step = from / to
+        for i in 0..<outCount {
+            let src = Double(i) * step
+            let i0 = min(input.count - 1, max(0, Int(src)))
+            let i1 = min(input.count - 1, i0 + 1)
+            let frac = src - Double(i0)
+            out[i] = Int16(
+                Double(input[i0]) * (1 - frac) + Double(input[i1]) * frac)
         }
+        return out
     }
 }

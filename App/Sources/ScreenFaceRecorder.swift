@@ -468,7 +468,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         let pts = chunk.pts
         if !sessionStartTime.isValid { sessionStartTime = pts }
         guard CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
-        if let last = lastAudioPTS, CMTimeCompare(pts, last) <= 0 { return }
+        if let last = lastAudioPTS, CMTimeCompare(pts, last) < 0 { return }
         lastAudioPTS = pts
 
         let frames = chunk.frameCount
@@ -570,7 +570,8 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
 
         var timing = CMSampleTimingInfo(
             duration: CMTime(
-                value: 1, timescale: CMTimeScale(format.sampleRate)),
+                value: CMTimeValue(frameCount),
+                timescale: CMTimeScale(format.sampleRate)),
             presentationTimeStamp: pts,
             decodeTimeStamp: .invalid)
         var sbuf: CMSampleBuffer?
