@@ -291,6 +291,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             stopTimer()
             stopPolling()
             stopPiP()
+            endBroadcast()
             videoInput?.markAsFinished()
             audioInput?.markAsFinished()
             writer?.finishWriting {
@@ -301,10 +302,20 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
 
     /// Stops the system broadcast without an error sheet.
     private func endBroadcast() {
-        DispatchQueue.main.async {
-            let c = RPBroadcastController()
-            guard c.isBroadcasting else { return }
-            c.finishBroadcast { _ in }
+        reader?.requestStop()
+        DispatchQueue.main.async { [self] in
+            let owned = broadcastController
+            let fresh = RPBroadcastController()
+            if let owned, owned.isBroadcasting {
+                owned.finishBroadcast { _ in }
+            }
+            // Picker-started broadcasts never give us a controller; a
+            // new RPBroadcastController still talks to the live session.
+            if fresh.isBroadcasting {
+                fresh.finishBroadcast { _ in }
+            } else if owned == nil {
+                fresh.finishBroadcast { _ in }
+            }
         }
     }
 
@@ -398,7 +409,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
 
         CVPixelBufferLockBaseAddress(dest, [])
         LiveCombine.draw(
-            back: frame.pixelBuffer, front: latestFace,
+            back: frame.pixelBuffer, front: nil,
             placement: bubblePlacement, dest: dest)
         CVPixelBufferUnlockBaseAddress(dest, [])
 

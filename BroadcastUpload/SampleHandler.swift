@@ -68,6 +68,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         switch sampleBufferType {
         case .video:
+            if writer.pendingCommand == .stopRequested {
+                writer.setCommand(.ended)
+                self.writer = nil
+                return
+            }
             guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer)
             else { return }
             // The app consumes at most ~30 fps; screen capture delivers
