@@ -434,7 +434,8 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         guard audioInput.isReadyForMoreMediaData else { return }
 
         // First chunk defines the PCM format we convert everything to.
-        if audioConverter == nil {
+        if audioConverter == nil
+            || abs((audioConverter?.inputFormat.sampleRate ?? 0) - chunk.sampleRate) > 1 {
             var src = AudioStreamBasicDescription(
                 mSampleRate: chunk.sampleRate,
                 mFormatID: kAudioFormatLinearPCM,
@@ -508,7 +509,6 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         if let conversionError {
             os_log(.error, "DP audio convert fail: %@",
                    conversionError.localizedDescription)
-            fail("Audio conversion failed [\(conversionError.localizedDescription)].")
             return
         }
         guard outBuf.frameLength > 0,
@@ -620,7 +620,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVNumberOfChannelsKey: 1,
-            AVSampleRateKey: 32_000,
+            AVSampleRateKey: 44_100,
         ])
         audio.expectsMediaDataInRealTime = true
         w.add(audio)
@@ -672,8 +672,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         else { return }
 
         try? AVAudioSession.sharedInstance().setCategory(
-            .playAndRecord, mode: .videoChat,
-            options: [.mixWithOthers, .defaultToSpeaker])
+            .playback, mode: .moviePlayback, options: [.mixWithOthers])
         try? AVAudioSession.sharedInstance().setActive(true)
 
         let callVC = FacePipViewController()

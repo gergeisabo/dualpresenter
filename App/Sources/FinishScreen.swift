@@ -26,7 +26,6 @@ struct FinishScreen: View {
     let onDone: () -> Void
 
     @State private var shareItem: ShareItem?
-    @State private var saved = false
 
     private struct ShareItem: Identifiable {
         let url: URL
@@ -57,7 +56,7 @@ struct FinishScreen: View {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 56))
                 .foregroundStyle(.green)
-            Text(saved ? "Saved to Photos" : "Saving to Photos…")
+            Text("Saved to Photos")
                 .font(.title2.bold())
                 .foregroundStyle(.white)
             VideoThumb(url: url)
@@ -69,7 +68,6 @@ struct FinishScreen: View {
                 .buttonStyle(FinishButtonStyle(secondary: true))
         }
         .padding()
-        .onAppear { saveToPhotos(url) }
     }
 
     private var failedView: some View {
@@ -84,12 +82,6 @@ struct FinishScreen: View {
                 .buttonStyle(FinishButtonStyle(secondary: true))
         }
         .padding()
-    }
-
-    private func saveToPhotos(_ url: URL) {
-        PhotosSaver.saveVideo(url) { ok in
-            if ok { saved = true }
-        }
     }
 
     private func cleanupThenDone(_ url: URL) {

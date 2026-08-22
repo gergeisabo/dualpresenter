@@ -46,7 +46,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         with sampleBufferType: RPSampleBufferType
     ) {
         guard let writer else { return }
-        guard sampleBufferType == .video || sampleBufferType == .audioMic
+        guard sampleBufferType == .video
+                || sampleBufferType == .audioMic
+                || sampleBufferType == .audioApp
         else { return }
 
         // Orphan guard: if the app died (crash/kill), its heartbeat goes
@@ -84,39 +86,91 @@ final class SampleHandler: RPBroadcastSampleHandler {
             guard let slot = writer.beginVideoFrame(from: buffer)
             else { return }
             writer.commitVideoFrame(slot: slot, pts: pts)
-        case .audioMic:
-            let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
-            guard numSamples > 0 else { return }
-            // Canonical audio extraction (labels verified against the SDK
-            // header): AudioBufferList + retained CMBlockBuffer.
-            var list = AudioBufferList(
-                mNumberBuffers: 1,
-                mBuffers: AudioBuffer(
-                    mNumberChannels: 1, mDataByteSize: 0, mData: nil))
-            var block: CMBlockBuffer?
-            let st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-                sampleBuffer,
-                bufferListSizeNeededOut: nil,
-                bufferListOut: &list,
-                bufferListSize: MemoryLayout<AudioBufferList>.size,
-                blockBufferAllocator: kCFAllocatorDefault,
-                blockBufferMemoryAllocator: kCFAllocatorDefault,
-                flags: 0,
-                blockBufferOut: &block)
-            guard st == noErr, list.mBuffers.mDataByteSize > 0,
-                  let data = list.mBuffers.mData
-            else { return }
-            writer.storeAudio(
-                bytes: data,
-                byteCount: Int(list.mBuffers.mDataByteSize),
-                // NOTE: ReplayKit's pts is host-time seconds since boot,
-                // NOT duration — numSamples/pts.seconds is dimensionally
-                // wrong (yields ~0.003 Hz). Trust the buffer's own format.
-                sampleRate: 48000,
-                numChannels: Int(list.mBuffers.mNumberChannels),
-                pts: pts)
+        case .audioMic, .audioApp:
+            storeAudio(sampleBuffer, writer: writer, pts: pts)
         default:
             break
+        }
+    }
+
+    /// ReplayKit may deliver Float32 or Int16. Always store packed Int16
+    /// so the app-side writer has a known format. Uses the buffer's own
+    /// sample rate (not a hardcoded 48000).
+    private func storeAudio(
+        _ sampleBuffer: CMSampleBuffer,
+        writer: FrameBridge.Writer,
+        pts: CMTime
+    ) {
+        let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard numSamples > 0 else { return }
+
+        var rate = 44_100.0
+        var channels = 1
+        var isFloat = false
+        if let fmt = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee {
+            if asbd.mSampleRate > 0 { rate = asbd.mSampleRate }
+            channels = max(1, Int(asbd.mChannelsPerFrame))
+            isFloat = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        }
+
+        var listSize: Int = 0
+        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &listSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: 0,
+            blockBufferOut: nil)
+        guard listSize > 0 else { return }
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: listSize, alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        let abl = raw.assumingMemoryBound(to: AudioBufferList.self)
+        var block: CMBlockBuffer?
+        let st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: abl,
+            bufferListSize: listSize,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: 0,
+            blockBufferOut: &block)
+        guard st == noErr else { return }
+        let buf = abl.pointee.mBuffers
+        guard buf.mDataByteSize > 0, let data = buf.mData else { return }
+        let inChannels = max(1, Int(buf.mNumberChannels == 0 ? channels : Int(buf.mNumberChannels)))
+
+        // Downmix to mono Int16 for the ring.
+        var pcm = [Int16](repeating: 0, count: numSamples)
+        if isFloat {
+            let src = data.assumingMemoryBound(to: Float.self)
+            for i in 0..<numSamples {
+                var acc: Float = 0
+                for c in 0..<inChannels { acc += src[i * inChannels + c] }
+                acc /= Float(inChannels)
+                let clipped = max(-1, min(1, acc))
+                pcm[i] = Int16(clipped * Float(Int16.max))
+            }
+        } else {
+            let src = data.assumingMemoryBound(to: Int16.self)
+            for i in 0..<numSamples {
+                var acc = 0
+                for c in 0..<inChannels { acc += Int(src[i * inChannels + c]) }
+                pcm[i] = Int16(acc / inChannels)
+            }
+        }
+        pcm.withUnsafeBytes { raw in
+            guard let ptr = raw.baseAddress else { return }
+            writer.storeAudio(
+                bytes: ptr,
+                byteCount: pcm.count * 2,
+                sampleRate: rate,
+                numChannels: 1,
+                pts: pts)
         }
     }
 }
