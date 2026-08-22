@@ -57,7 +57,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
            Date().timeIntervalSince(startedAt) > 10 {
             writer.setCommand(.ended)
             self.writer = nil
-            finishBroadcastQuietly()
+            finishBroadcastWithError(NSError(
+                domain: RPRecordingErrorDomain,
+                code: RPRecordingErrorCode.failedToStart.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: "DualPresenter closed."]))
             return
         }
 
@@ -65,13 +68,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         switch sampleBufferType {
         case .video:
-            // App asked us to stop (user tapped Stop in the app).
-            if writer.pendingCommand == .stopRequested {
-                writer.setCommand(.ended)
-                self.writer = nil
-                finishBroadcastQuietly()
-                return
-            }
             guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer)
             else { return }
             // The app consumes at most ~30 fps; screen capture delivers
@@ -117,15 +113,5 @@ final class SampleHandler: RPBroadcastSampleHandler {
         default:
             break
         }
-    }
-
-    /// ReplayKit only lets the extension stop via finishBroadcastWithError.
-    /// userDeclined is the "user stopped" code — iOS does not show our
-    /// DualPresenter.BUE alert.
-    private func finishBroadcastQuietly() {
-        finishBroadcastWithError(NSError(
-            domain: RPRecordingErrorDomain,
-            code: RPRecordingErrorCode.userDeclined.rawValue,
-            userInfo: nil))
     }
 }

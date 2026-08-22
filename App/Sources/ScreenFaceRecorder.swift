@@ -73,7 +73,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
 
     // PiP facecam
     private var pipController: AVPictureInPictureController?
-    private var pipDisplayLayer: AVSampleBufferDisplayLayer?
+    private var pipCallVC: FacePipViewController?
     private var pipWindow: UIWindow?
     private var pipHost: UIView?
 
@@ -298,11 +298,13 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         }
     }
 
-    /// Asks the extension to end the broadcast (bridge stop command).
-    /// Called after the file is safely finished. The user can also stop
-    /// via the red pill / Control Center — pollBridge sees .ended.
+    /// Stops the system broadcast without an error sheet.
     private func endBroadcast() {
-        reader?.requestStop()
+        DispatchQueue.main.async {
+            let c = RPBroadcastController()
+            guard c.isBroadcasting else { return }
+            c.stopBroadcast { _ in }
+        }
     }
 
     private func complete() {
@@ -638,8 +640,8 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     private var pipObservers: [NSObjectProtocol] = []
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
 
-    /// Build the face layer + PiP controller. Do NOT start PiP here —
-    /// starting while still in DualPresenter shows a black app snapshot.
+    /// Build video-call PiP (face only, no play/skip chrome). Do NOT start
+    /// it here — starting in DualPresenter shows a player of the app.
     private func preparePiP() {
         guard pipController == nil else { return }
         guard AVPictureInPictureController.isPictureInPictureSupported()
@@ -650,14 +652,9 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             options: [.mixWithOthers, .defaultToSpeaker])
         try? AVAudioSession.sharedInstance().setActive(true)
 
-        let layer = AVSampleBufferDisplayLayer()
-        layer.videoGravity = .resizeAspectFill
-        let source = AVPictureInPictureController.ContentSource(
-            sampleBufferDisplayLayer: layer, playbackDelegate: self)
-        let controller = AVPictureInPictureController(contentSource: source)
-        controller.canStartPictureInPictureAutomaticallyFromInline = true
-        pipDisplayLayer = layer
-        pipController = controller
+        let callVC = FacePipViewController()
+        callVC.preferredContentSize = CGSize(width: 9, height: 16)
+        pipCallVC = callVC
 
         guard let scene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene }).first
@@ -670,12 +667,17 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         host.backgroundColor = .clear
         host.isUserInteractionEnabled = false
         host.alpha = 0.01
-        layer.frame = host.bounds
-        host.layer.addSublayer(layer)
         window.addSubview(host)
         window.isHidden = false
         pipWindow = window
         pipHost = host
+
+        let source = AVPictureInPictureController.ContentSource(
+            activeVideoCallSourceView: host,
+            contentViewController: callVC)
+        let controller = AVPictureInPictureController(contentSource: source)
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
+        pipController = controller
 
         let nc = NotificationCenter.default
         pipObservers.append(nc.addObserver(
@@ -714,15 +716,13 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         // UIKit + FrontBoard require main-thread for window/layer teardown
         // (crash 2026-08-21-141441: UIWindow._setHidden off-main → SIGTRAP).
         let controller = pipController
-        let layer = pipDisplayLayer
         let observers = pipObservers
         pipObservers = []
         pipController = nil
-        pipDisplayLayer = nil
+        pipCallVC = nil
         DispatchQueue.main.async { [weak self] in
             observers.forEach { NotificationCenter.default.removeObserver($0) }
             controller?.stopPictureInPicture()
-            layer?.flush()
             self?.pipHost?.removeFromSuperview()
             self?.pipHost = nil
             self?.pipWindow?.isHidden = true
@@ -740,10 +740,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         _ pixelBuffer: CVPixelBuffer, pts: CMTime
     ) {
         latestFace = pixelBuffer
-        guard let layer = pipDisplayLayer else { return }
-        guard let sbuf = makeVideoSampleBuffer(
-            from: pixelBuffer, pts: pts) else { return }
-        layer.enqueue(sbuf)
+        pipCallVC?.enqueue(pixelBuffer, pts: pts)
     }
 
     /// CVPixelBuffer → CMSampleBuffer (canonical CoreMedia path).
@@ -884,36 +881,46 @@ extension ScreenFaceRecorder: AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 }
 
-// MARK: - PiP playback delegate
+/// Zoom-style face bubble for video-call PiP (no play / skip chrome).
+final class FacePipViewController: AVPictureInPictureVideoCallViewController {
+    private let layer = AVSampleBufferDisplayLayer()
 
-extension ScreenFaceRecorder: AVPictureInPictureSampleBufferPlaybackDelegate {
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        setPlaying playing: Bool
-    ) {}
-
-    func pictureInPictureControllerTimeRangeForPlayback(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> CMTimeRange {
-        CMTimeRange(start: .invalid, duration: .positiveInfinity)
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        layer.videoGravity = .resizeAspectFill
+        view.layer.addSublayer(layer)
     }
 
-    func pictureInPictureControllerIsPlaybackPaused(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> Bool {
-        false
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        layer.frame = view.bounds
     }
 
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        didTransitionToRenderSize newRenderSize: CMVideoDimensions
-    ) {}
-
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        skipByInterval skipInterval: CMTime,
-        completion completionHandler: @escaping () -> Void
-    ) {
-        completionHandler()
+    func enqueue(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+        var formatDescription: CMVideoFormatDescription?
+        let fc = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &formatDescription)
+        guard fc == noErr, let formatDescription else { return }
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: pts,
+            decodeTimeStamp: .invalid)
+        var sbuf: CMSampleBuffer?
+        let err = withUnsafePointer(to: &timing) { timingPtr in
+            CMSampleBufferCreateForImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: pixelBuffer,
+                dataReady: true,
+                makeDataReadyCallback: nil,
+                refcon: nil,
+                formatDescription: formatDescription,
+                sampleTiming: timingPtr,
+                sampleBufferOut: &sbuf)
+        }
+        guard err == noErr, let sbuf else { return }
+        layer.enqueue(sbuf)
     }
 }
