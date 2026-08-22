@@ -57,6 +57,8 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
     private var outputURL: URL?
     private var writerStarted = false     // startSession called
     private var sessionStartTime: CMTime = .invalid
+    private var lastVideoPTS: CMTime?
+    private var lastAudioPTS: CMTime?
 
     // Latest front frame for the bubble (replaced as they arrive).
     private var latestFront: CVPixelBuffer?
@@ -185,6 +187,8 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
                 outputURL = made.url
                 sessionStartTime = .invalid
                 writerStarted = false
+                lastVideoPTS = nil
+                lastAudioPTS = nil
                 latestFront = nil
                 // Writers MUST enter .writing before startSession(atSourceTime:)
                 // (device crash 160528: "Cannot call method when status is 0").
@@ -273,6 +277,8 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         writer = nil; videoInput = nil; audioInput = nil; adaptor = nil
         outputURL = nil
         writerStarted = false
+        lastVideoPTS = nil
+        lastAudioPTS = nil
         sessionStartTime = .invalid
         latestFront = nil
     }
@@ -293,6 +299,8 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if !sessionStartTime.isValid { sessionStartTime = pts }
         guard CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
+        if let last = lastVideoPTS, CMTimeCompare(pts, last) <= 0 { return }
+        lastVideoPTS = pts
 
         guard videoInput.isReadyForMoreMediaData else { return }
         guard let pool = destPool else { return }
@@ -323,6 +331,8 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         guard sessionStartTime.isValid,
               CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
+        if let last = lastAudioPTS, CMTimeCompare(pts, last) <= 0 { return }
+        lastAudioPTS = pts
         if !writerStarted {
             writer.startSession(atSourceTime: pts)
             writerStarted = true

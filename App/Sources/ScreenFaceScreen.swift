@@ -29,7 +29,6 @@ struct ScreenFaceScreen: View {
             VStack {
                 header
                 Spacer()
-                if recorder.state == .armed { startControls }
                 if recorder.state == .recording { recordingControls }
             }
         }
@@ -91,11 +90,9 @@ struct ScreenFaceScreen: View {
                 bubbleSize: 110
             )
             if recorder.state == .armed {
-                Text("Broadcast live — place your face bubble, then start.\nThen open any app and present.")
+                Text("Starting…")
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.8))
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 28)
             }
         }
     }
@@ -144,26 +141,6 @@ struct ScreenFaceScreen: View {
             }
         }
         .padding()
-    }
-
-    private var startControls: some View {
-        VStack(spacing: 10) {
-            Button {
-                recorder.startRecording()
-            } label: {
-                HStack {
-                    Image(systemName: "record.circle")
-                        .font(.system(size: 22, weight: .bold))
-                    Text("Record")
-                        .font(.headline)
-                }
-                .padding(.horizontal, 28)
-                .padding(.vertical, 14)
-                .background(.white.opacity(0.15), in: Capsule())
-                .foregroundStyle(.white)
-            }
-        }
-        .padding(.bottom, 24)
     }
 
     private var recordingControls: some View {

@@ -58,6 +58,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     private var outputURL: URL?
     private var writerStarted = false
     private var lastVideoPTS: CMTime?
+    private var lastAudioPTS: CMTime?
     private var sessionStartTime: CMTime = .invalid
     private var phase: Phase = .idle
     enum Phase { case idle, armed, recording, finishing }
@@ -253,6 +254,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
                 sessionStartTime = .invalid
                 writerStarted = false
                 lastVideoPTS = nil
+                lastAudioPTS = nil
                 latestFace = nil
                 audioConverter = nil
                 audioOutputFormat = nil
@@ -445,6 +447,8 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         let pts = chunk.pts
         if !sessionStartTime.isValid { sessionStartTime = pts }
         guard CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
+        if let last = lastAudioPTS, CMTimeCompare(pts, last) <= 0 { return }
+        lastAudioPTS = pts
 
         let frames = chunk.frameCount
         guard frames > 0,
@@ -617,6 +621,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         outputURL = nil
         writerStarted = false
         lastVideoPTS = nil
+        lastAudioPTS = nil
         sessionStartTime = .invalid
         latestFace = nil
         audioConverter = nil
