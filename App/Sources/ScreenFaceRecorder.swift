@@ -42,24 +42,27 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     // sessionQueue-confined below (bridge polling reads only snapshots).
     private let sessionQueue = DispatchQueue(label: "dualpresenter.sf.session")
     private let videoQueue = DispatchQueue(label: "dualpresenter.sf.video")
+    private let audioQueue = DispatchQueue(label: "dualpresenter.sf.audio")
     private let bridgeQueue = DispatchQueue(label: "dualpresenter.sf.bridge")
 
     private var broadcastController: RPBroadcastController?
     private var faceInput: AVCaptureDeviceInput?
     private let faceOutput = AVCaptureVideoDataOutput()
+    private let micOutput = AVCaptureAudioDataOutput()
     private var faceConfigured = false
     private var latestFace: CVPixelBuffer?
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
-    private var audioInput: AVAssetWriterInput?
-    private var audioConverter: AVAudioConverter?
-    private var audioOutputFormat: AVAudioFormat?
+    private var appAudioInput: AVAssetWriterInput?
+    private var micAudioInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var outputURL: URL?
     private var writerStarted = false
     private var lastVideoPTS: CMTime?
-    private var lastAudioPTS: CMTime?
+    private var lastAppAudioPTS: CMTime?
+    private var lastMicPTS: CMTime?
+    private var firstMicPTS: CMTime = .invalid
     private var sessionStartTime: CMTime = .invalid
     private var phase: Phase = .idle
     enum Phase { case idle, armed, recording, finishing }
@@ -187,13 +190,15 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
 
     private func configureFaceIfNeeded() {
         guard !faceConfigured else { return }
-        AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-            guard let self else { return }
-            guard granted else {
-                self.publish(.error("Camera access is required."))
-                return
+        AVCaptureDevice.requestAccess(for: .video) { [weak self] videoOK in
+            AVCaptureDevice.requestAccess(for: .audio) { _ in
+                guard let self else { return }
+                guard videoOK else {
+                    self.publish(.error("Camera access is required."))
+                    return
+                }
+                self.sessionQueue.async { self.configureFace() }
             }
-            self.sessionQueue.async { self.configureFace() }
         }
     }
 
@@ -220,6 +225,15 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         faceOutput.setSampleBufferDelegate(self, queue: videoQueue)
         if session.canAddOutput(faceOutput) {
             session.addOutput(faceOutput)
+        }
+        if let mic = AVCaptureDevice.default(for: .audio),
+           let micIn = try? AVCaptureDeviceInput(device: mic),
+           session.canAddInput(micIn) {
+            session.addInput(micIn)
+        }
+        micOutput.setSampleBufferDelegate(self, queue: audioQueue)
+        if session.canAddOutput(micOutput) {
+            session.addOutput(micOutput)
         }
         if session.isMultitaskingCameraAccessSupported {
             session.isMultitaskingCameraAccessEnabled = true
@@ -252,16 +266,17 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
                 let made = try makeWriter()
                 writer = made.writer
                 videoInput = made.video
-                audioInput = made.audio
+                appAudioInput = made.appAudio
+                micAudioInput = made.micAudio
                 adaptor = made.adaptor
                 outputURL = made.url
                 sessionStartTime = .invalid
                 writerStarted = false
                 lastVideoPTS = nil
-                lastAudioPTS = nil
+                lastAppAudioPTS = nil
+                lastMicPTS = nil
+                firstMicPTS = .invalid
                 latestFace = nil
-                audioConverter = nil
-                audioOutputFormat = nil
                 // Writers MUST enter .writing before startSession
                 // (crash lesson 160528).
                 writer?.startWriting()
@@ -293,7 +308,8 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             stopPiP()
             endBroadcast()
             videoInput?.markAsFinished()
-            audioInput?.markAsFinished()
+            appAudioInput?.markAsFinished()
+            micAudioInput?.markAsFinished()
             writer?.finishWriting {
                 self.sessionQueue.async { self.complete() }
             }
@@ -430,182 +446,111 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
 
     private func appendAudio(_ chunk: FrameBridge.AudioChunk) {
         guard phase == .recording else { return }
-        guard let audioInput else { return }
-        guard audioInput.isReadyForMoreMediaData else { return }
-
-        // First chunk defines the PCM format we convert everything to.
-        if audioConverter == nil
-            || abs((audioConverter?.inputFormat.sampleRate ?? 0) - chunk.sampleRate) > 1 {
-            var src = AudioStreamBasicDescription(
-                mSampleRate: chunk.sampleRate,
-                mFormatID: kAudioFormatLinearPCM,
-                mFormatFlags: 0x0c,   // packed | signed integer
-                mBytesPerPacket: UInt32(chunk.channels * 2),
-                mFramesPerPacket: 1,
-                mBytesPerFrame: UInt32(chunk.channels * 2),
-                mChannelsPerFrame: UInt32(chunk.channels),
-                mBitsPerChannel: 16, mReserved: 0)
-            guard src.mSampleRate > 0 else { return }
-            let srcPtr = withUnsafePointer(to: &src) { $0 }
-            guard let inFormat = AVAudioFormat(streamDescription: srcPtr)
-            else { return }
-            var dst = AudioStreamBasicDescription(
-                mSampleRate: src.mSampleRate,
-                mFormatID: kAudioFormatLinearPCM,
-                mFormatFlags: 0x0c,   // packed | signed integer
-                mBytesPerPacket: 2, mFramesPerPacket: 1, mBytesPerFrame: 2,
-                mChannelsPerFrame: 1, mBitsPerChannel: 16, mReserved: 0)
-            let dstPtr = withUnsafePointer(to: &dst) { $0 }
-            guard let outFormat = AVAudioFormat(streamDescription: dstPtr)
-            else { return }
-            audioConverter = AVAudioConverter(from: inFormat, to: outFormat)
-            audioOutputFormat = outFormat
-        }
-        guard let converter = audioConverter,
-              let outFormat = audioOutputFormat
-        else { return }
-
+        guard let appAudioInput, appAudioInput.isReadyForMoreMediaData else { return }
         let pts = chunk.pts
         if !sessionStartTime.isValid { sessionStartTime = pts }
         guard CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
-        if let last = lastAudioPTS, CMTimeCompare(pts, last) < 0 { return }
-        lastAudioPTS = pts
-
-        let frames = chunk.frameCount
-        guard frames > 0,
-              chunk.data.count >= frames * chunk.channels * 2
-        else { return }
-        guard let inBuf = AVAudioPCMBuffer(
-            pcmFormat: converter.inputFormat,
-            frameCapacity: AVAudioFrameCount(frames))
-        else { return }
-        inBuf.frameLength = AVAudioFrameCount(frames)
-        chunk.data.withUnsafeBytes { raw in
-            if let src = raw.baseAddress,
-               let dst = inBuf.int16ChannelData?[0] {
-                memcpy(dst, src, frames * chunk.channels * 2)
-            }
-        }
-
-        let ratio = converter.outputFormat.sampleRate
-            / converter.inputFormat.sampleRate
-        let cap = AVAudioFrameCount(Double(frames) * ratio) + 32
-        guard let outBuf = AVAudioPCMBuffer(
-            pcmFormat: outFormat, frameCapacity: cap)
-        else { return }
-
-        var conversionError: NSError?
-        var consumed = false
-        converter.convert(to: outBuf, error: &conversionError) {
-            _, inputStatus in
-            if consumed {
-                inputStatus.pointee = .noDataNow
-                return nil
-            }
-            consumed = true
-            inputStatus.pointee = .haveData
-            return inBuf
-        }
-        if let conversionError {
-            os_log(.error, "DP audio convert fail: %@",
-                   conversionError.localizedDescription)
-            return
-        }
-        guard outBuf.frameLength > 0,
-              let sample = makeSampleBuffer(
-                from: outBuf, pts: pts, format: outFormat)
-        else { return }
-
+        if let last = lastAppAudioPTS, CMTimeCompare(pts, last) < 0 { return }
+        lastAppAudioPTS = pts
+        guard let sample = makeRawAudioBuffer(chunk) else { return }
         if !writerStarted, let writer {
             writer.startSession(atSourceTime: pts)
             writerStarted = true
         }
-        if !audioInput.append(sample) {
-            let nsErr = writer?.error.map { "\($0.localizedDescription) (\(($0 as NSError).code))" }
-                ?? "unknown"
-            os_log(.error, "DP appendAudio fail: err=%@", nsErr)
-            fail("Could not write audio [\(nsErr)].")
-        }
+        _ = appAudioInput.append(sample)
     }
 
-    /// Canonical PCM → CMSampleBuffer: heap block handed to a
-    /// CMBlockBuffer (which owns/frees it), then an audio sample buffer
-    /// with one timing entry.
-    private func makeSampleBuffer(
-        from buffer: AVAudioPCMBuffer, pts: CMTime, format: AVAudioFormat
-    ) -> CMSampleBuffer? {
-        let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0,
-              let pcm = buffer.int16ChannelData?[0]
-        else { return nil }
-        let bytes = frameCount * 2
-        let mem = UnsafeMutableRawPointer.allocate(
-            byteCount: bytes, alignment: 16)
-        memcpy(mem, pcm, bytes)
+    private func appendMic(_ sampleBuffer: CMSampleBuffer) {
+        guard phase == .recording else { return }
+        guard let micAudioInput, micAudioInput.isReadyForMoreMediaData else { return }
+        guard sessionStartTime.isValid else { return }
+        let srcPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if !firstMicPTS.isValid { firstMicPTS = srcPTS }
+        let pts = sessionStartTime + (srcPTS - firstMicPTS)
+        if let last = lastMicPTS, CMTimeCompare(pts, last) < 0 { return }
+        lastMicPTS = pts
+        // ReplayKit and capture clocks differ — retag PTS onto a copy.
+        guard let retagged = retag(sampleBuffer, pts: pts) else { return }
+        if !writerStarted, let writer {
+            writer.startSession(atSourceTime: pts)
+            writerStarted = true
+        }
+        _ = micAudioInput.append(retagged)
+    }
 
+    private func makeRawAudioBuffer(_ chunk: FrameBridge.AudioChunk) -> CMSampleBuffer? {
+        var asbd = chunk.asbd
+        guard asbd.mSampleRate > 0, asbd.mBytesPerFrame > 0 else { return nil }
+        let frames = chunk.data.count / Int(asbd.mBytesPerFrame)
+        guard frames > 0 else { return nil }
+        var format: CMAudioFormatDescription?
+        guard CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, asbd: &asbd,
+            layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil,
+            extensions: nil, formatDescriptionOut: &format) == noErr,
+              let format else { return nil }
+        let bytes = chunk.data.count
+        let mem = UnsafeMutableRawPointer.allocate(byteCount: bytes, alignment: 16)
+        chunk.data.copyBytes(to: mem.assumingMemoryBound(to: UInt8.self), count: bytes)
         var block: CMBlockBuffer?
-        let st0 = CMBlockBufferCreateEmpty(
-            allocator: kCFAllocatorDefault,
-            capacity: UInt32(bytes),
-            flags: 0,
-            blockBufferOut: &block)
+        let st0 = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: mem, blockLength: bytes,
+            blockAllocator: nil, customBlockSource: nil, offsetToData: 0,
+            dataLength: bytes, flags: 0, blockBufferOut: &block)
         guard st0 == kCMBlockBufferNoErr, let blk = block else {
             mem.deallocate()
             return nil
         }
-        // On success the block buffer owns `mem` and frees it.
-        let st1 = CMBlockBufferAppendMemoryBlock(
-            blk,
-            memoryBlock: mem,
-            length: bytes,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: bytes,
-            flags: 0)
-        guard st1 == kCMBlockBufferNoErr else {
-            mem.deallocate()
-            return nil
-        }
-
         var timing = CMSampleTimingInfo(
-            duration: CMTime(
-                value: CMTimeValue(frameCount),
-                timescale: CMTimeScale(format.sampleRate)),
-            presentationTimeStamp: pts,
+            duration: CMTime(value: CMTimeValue(frames),
+                             timescale: CMTimeScale(asbd.mSampleRate)),
+            presentationTimeStamp: chunk.pts,
             decodeTimeStamp: .invalid)
         var sbuf: CMSampleBuffer?
-        let st2 = withUnsafePointer(to: &timing) { timingPtr in
+        let st1 = withUnsafePointer(to: &timing) { timingPtr in
             CMSampleBufferCreate(
-                allocator: kCFAllocatorDefault,
-                dataBuffer: blk,
-                dataReady: true,
-                makeDataReadyCallback: nil,
-                refcon: nil,
-                formatDescription: format.formatDescription,
-                sampleCount: frameCount,
-                sampleTimingEntryCount: 1,
-                sampleTimingArray: timingPtr,
-                sampleSizeEntryCount: 0,
-                sampleSizeArray: nil,
+                allocator: kCFAllocatorDefault, dataBuffer: blk, dataReady: true,
+                makeDataReadyCallback: nil, refcon: nil,
+                formatDescription: format, sampleCount: frames,
+                sampleTimingEntryCount: 1, sampleTimingArray: timingPtr,
+                sampleSizeEntryCount: 0, sampleSizeArray: nil,
                 sampleBufferOut: &sbuf)
         }
-        guard st2 == noErr else { return nil }
+        guard st1 == noErr else { return nil }
         return sbuf
+    }
+
+    private func retag(_ sampleBuffer: CMSampleBuffer, pts: CMTime) -> CMSampleBuffer? {
+        var count: CMItemCount = 0
+        CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 0,
+                                               arrayToFill: nil, entriesNeededOut: &count)
+        var times = Array(repeating: CMSampleTimingInfo(), count: Int(count))
+        CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: count,
+                                               arrayToFill: &times, entriesNeededOut: &count)
+        for i in times.indices {
+            let delta = times[i].presentationTimeStamp - times[0].presentationTimeStamp
+            times[i].presentationTimeStamp = pts + delta
+        }
+        var out: CMSampleBuffer?
+        CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault, sampleBuffer: sampleBuffer,
+            sampleTimingEntryCount: count, sampleTimingArray: &times,
+            sampleBufferOut: &out)
+        return out
     }
 
     // MARK: - Writer (same shape as M1: H.264 1080x1920 + AAC)
 
     private func makeWriter() throws -> (writer: AVAssetWriter,
                                          video: AVAssetWriterInput,
-                                         audio: AVAssetWriterInput,
+                                         appAudio: AVAssetWriterInput,
+                                         micAudio: AVAssetWriterInput,
                                          adaptor: AVAssetWriterInputPixelBufferAdaptor,
                                          url: URL) {
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("DP-\(UUID().uuidString)").appendingPathExtension("mp4")
         let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
-        // Width/height REQUIRED on iOS 18 (crash lesson 155017).
         let video = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: 1080,
@@ -618,17 +563,23 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         video.expectsMediaDataInRealTime = true
         w.add(video)
 
-        let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVNumberOfChannelsKey: 1,
-            AVSampleRateKey: 44_100,
-        ])
-        audio.expectsMediaDataInRealTime = true
-        w.add(audio)
+        func aac() -> AVAssetWriterInput {
+            let a = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: 1,
+                AVSampleRateKey: 44_100,
+            ])
+            a.expectsMediaDataInRealTime = true
+            return a
+        }
+        let appAudio = aac()
+        let micAudio = aac()
+        w.add(appAudio)
+        w.add(micAudio)
 
         let ad = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: video, sourcePixelBufferAttributes: nil)
-        return (w, video, audio, ad, url)
+        return (w, video, appAudio, micAudio, ad, url)
     }
 
     private func teardownWriter(cancel: Bool) {
@@ -638,15 +589,15 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
                 try? FileManager.default.removeItem(at: url)
             }
         }
-        writer = nil; videoInput = nil; audioInput = nil; adaptor = nil
+        writer = nil; videoInput = nil; appAudioInput = nil; micAudioInput = nil; adaptor = nil
         outputURL = nil
         writerStarted = false
         lastVideoPTS = nil
-        lastAudioPTS = nil
+        lastAppAudioPTS = nil
+        lastMicPTS = nil
+        firstMicPTS = .invalid
         sessionStartTime = .invalid
         latestFace = nil
-        audioConverter = nil
-        audioOutputFormat = nil
     }
 
     // MARK: - PiP facecam (Zoom: float face only AFTER leaving the app)
@@ -673,7 +624,8 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         else { return }
 
         try? AVAudioSession.sharedInstance().setCategory(
-            .playback, mode: .moviePlayback, options: [.mixWithOthers])
+            .playAndRecord, mode: .videoRecording,
+            options: [.mixWithOthers, .defaultToSpeaker])
         try? AVAudioSession.sharedInstance().setActive(true)
 
         let callVC = FacePipViewController()
@@ -899,17 +851,22 @@ extension ScreenFaceRecorder: AVPictureInPictureControllerDelegate {
 
 // MARK: - Face camera delegate
 
-extension ScreenFaceRecorder: AVCaptureVideoDataOutputSampleBufferDelegate {
+extension ScreenFaceRecorder: AVCaptureVideoDataOutputSampleBufferDelegate,
+                               AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(
         _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        if output === micOutput {
+            sessionQueue.async { [weak self] in
+                self?.appendMic(sampleBuffer)
+            }
+            return
+        }
         guard output === faceOutput,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        // Hop to sessionQueue so `latestFace` and the PiP layer are
-        // touched from exactly one queue (same confinement as M1).
         sessionQueue.async { [weak self] in
             self?.handleFaceFrame(pixelBuffer, pts: pts)
         }

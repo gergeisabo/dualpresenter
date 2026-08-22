@@ -230,28 +230,37 @@ enum FrameBridge {
             map.unlock()
         }
 
-        /// Stores one audio chunk (interleaved Int16 PCM + format facts).
+        /// Stores one raw ReplayKit audio buffer (native format, not converted).
         func storeAudio(
             bytes: UnsafeRawPointer, byteCount: Int,
-            sampleRate: Double, numChannels: Int,
+            asbd: AudioStreamBasicDescription,
             pts: CMTime
         ) {
-            let n = min(byteCount, audioSlotBytes)
-            map.lock(exclusive: true)
-            let slot = Int(map.audioWriteSeq % UInt64(audioSlotCount))
-            let dataPtr = map.base + audioDataOffset + slot * audioSlotBytes
-            memcpy(dataPtr, bytes, n)
-            let metaOffset = 184 + slot * 104
-            map.base.advanced(by: metaOffset).storeBytes(of: map.audioWriteSeq, as: UInt64.self)
-            let p = PTS(time: pts)
-            map.base.advanced(by: metaOffset + 8).storeBytes(of: p, as: PTS.self)
-            map.base.advanced(by: metaOffset + 32).storeBytes(of: UInt32(n), as: UInt32.self)
-            map.base.advanced(by: metaOffset + 44).storeBytes(
-                of: sampleRate, as: Double.self)
-            map.base.advanced(by: metaOffset + 52).storeBytes(
-                of: UInt32(max(1, numChannels)), as: UInt32.self)
-            map.base.advanced(by: 16).storeBytes(of: map.audioWriteSeq + 1, as: UInt64.self)
-            map.unlock()
+            let bpf = max(1, Int(asbd.mBytesPerFrame))
+            var offset = 0
+            var t = pts
+            while offset < byteCount {
+                let n = min(audioSlotBytes / bpf * bpf, byteCount - offset)
+                guard n > 0 else { break }
+                map.lock(exclusive: true)
+                let slot = Int(map.audioWriteSeq % UInt64(audioSlotCount))
+                let dataPtr = map.base + audioDataOffset + slot * audioSlotBytes
+                memcpy(dataPtr, bytes + offset, n)
+                let metaOffset = 184 + slot * 104
+                map.base.advanced(by: metaOffset).storeBytes(of: map.audioWriteSeq, as: UInt64.self)
+                map.base.advanced(by: metaOffset + 8).storeBytes(of: PTS(time: t), as: PTS.self)
+                map.base.advanced(by: metaOffset + 32).storeBytes(of: UInt32(n), as: UInt32.self)
+                var desc = asbd
+                memcpy(map.base + metaOffset + 40, &desc, MemoryLayout<AudioStreamBasicDescription>.size)
+                map.base.advanced(by: 16).storeBytes(of: map.audioWriteSeq + 1, as: UInt64.self)
+                map.unlock()
+                offset += n
+                let frames = n / bpf
+                if asbd.mSampleRate > 0 {
+                    t = t + CMTime(value: CMTimeValue(frames),
+                                   timescale: CMTimeScale(asbd.mSampleRate))
+                }
+            }
         }
 
         func setCommand(_ command: Command) {
@@ -294,13 +303,8 @@ enum FrameBridge {
     struct AudioChunk {
         let seq: UInt64
         let pts: CMTime
-        let data: Data              // interleaved Int16 PCM
-        let sampleRate: Double
-        let channels: Int
-        /// Frames (samples per channel) in `data`.
-        var frameCount: Int {
-            channels > 0 ? data.count / (channels * 2) : 0
-        }
+        let data: Data
+        let asbd: AudioStreamBasicDescription
     }
 
     final class Reader {
@@ -394,19 +398,14 @@ enum FrameBridge {
                     continue
                 }
                 byteCount = min(byteCount, audioSlotBytes)
-                // +44 is NOT 8-byte aligned (184 + slot*104 + 44 ≡ 4 mod 8);
-                // load(as: Double.self) TRAPS on misalignment (crash
-                // 2026-08-21-122529). loadUnaligned is the sanctioned read.
-                let sampleRate = map.base.advanced(by: metaOffset + 44)
-                    .loadUnaligned(as: Double.self)
-                let channels = max(1, Int(map.base.advanced(by: metaOffset + 52)
-                    .load(as: UInt32.self)))
+                var asbd = AudioStreamBasicDescription()
+                memcpy(&asbd, map.base + metaOffset + 40,
+                       MemoryLayout<AudioStreamBasicDescription>.size)
                 let data = Data(bytes: map.base + audioDataOffset
                                     + slot * audioSlotBytes,
                                 count: byteCount)
                 chunks.append(AudioChunk(
-                    seq: seq, pts: pts.cmTime, data: data,
-                    sampleRate: sampleRate, channels: channels))
+                    seq: seq, pts: pts.cmTime, data: data, asbd: asbd))
                 lastAudioSeq += 1
             }
             return chunks
