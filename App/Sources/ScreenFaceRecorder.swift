@@ -220,6 +220,9 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         if session.canAddOutput(faceOutput) {
             session.addOutput(faceOutput)
         }
+        if session.isMultitaskingCameraAccessSupported {
+            session.isMultitaskingCameraAccessEnabled = true
+        }
         session.commitConfiguration()
 
         if let c = faceOutput.connection(with: .video) {
@@ -265,7 +268,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
                 publish(.recording)
                 startTimer()
                 startPolling()
-                DispatchQueue.main.async { self.startPiPIfNeeded() }
+                DispatchQueue.main.async { self.preparePiP() }
             } catch {
                 teardownWriter(cancel: true)
                 phase = .armed
@@ -400,11 +403,13 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             writerStarted = true
         }
         if !adaptor.append(dest, withPresentationTime: pts) {
-            let nsErr = writer.error.map { "\($0.localizedDescription) (\(($0 as NSError).code))" }
-                ?? "unknown"
+            let nsErr = writer.error as NSError?
+            let code = nsErr?.code ?? 0
             os_log(.error, "DP appendVideo fail: pts=%@ status=%@ err=%@",
-                   "\(pts)", "\(writer.status)", nsErr)
-            fail("Could not write video [\(nsErr)].")
+                   "\(pts)", "\(writer.status)",
+                   "\(nsErr?.localizedDescription ?? "unknown") (\(code))")
+            if code == -11847 { return }
+            fail("Could not write video [\(nsErr?.localizedDescription ?? "unknown") (\(code))].")
         }
     }
 
@@ -628,17 +633,28 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         audioOutputFormat = nil
     }
 
-    // MARK: - PiP facecam (Zoom's pattern: keeps camera alive in bg)
+    // MARK: - PiP facecam (Zoom: float face only AFTER leaving the app)
 
-    private func startPiPIfNeeded() {
+    private var pipObservers: [NSObjectProtocol] = []
+    private var bgTask: UIBackgroundTaskIdentifier = .invalid
+
+    /// Build the face layer + PiP controller. Do NOT start PiP here —
+    /// starting while still in DualPresenter shows a black app snapshot.
+    private func preparePiP() {
+        guard pipController == nil else { return }
         guard AVPictureInPictureController.isPictureInPictureSupported()
         else { return }
 
+        try? AVAudioSession.sharedInstance().setCategory(
+            .playAndRecord, mode: .videoChat,
+            options: [.mixWithOthers, .defaultToSpeaker])
+        try? AVAudioSession.sharedInstance().setActive(true)
+
         let layer = AVSampleBufferDisplayLayer()
-        let controller: AVPictureInPictureController
+        layer.videoGravity = .resizeAspectFill
         let source = AVPictureInPictureController.ContentSource(
             sampleBufferDisplayLayer: layer, playbackDelegate: self)
-        controller = AVPictureInPictureController(contentSource: source)
+        let controller = AVPictureInPictureController(contentSource: source)
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         pipDisplayLayer = layer
         pipController = controller
@@ -650,21 +666,48 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         window.windowLevel = .normal + 1
         window.backgroundColor = .clear
         window.isUserInteractionEnabled = false
-        let host = UIView()
-        host.frame = CGRect(x: -400, y: -400, width: 180, height: 320)
+        let host = UIView(frame: CGRect(x: 0, y: 0, width: 2, height: 2))
+        host.backgroundColor = .clear
+        host.isUserInteractionEnabled = false
+        host.alpha = 0.01
         layer.frame = host.bounds
-        layer.videoGravity = .resizeAspect
         host.layer.addSublayer(layer)
         window.addSubview(host)
         window.isHidden = false
         pipWindow = window
         pipHost = host
 
-        // Active playback audio session is required for background PiP.
-        try? AVAudioSession.sharedInstance().setCategory(
-            .playback, mode: .default)
-        try? AVAudioSession.sharedInstance().setActive(true)
-        controller.startPictureInPicture()
+        let nc = NotificationCenter.default
+        pipObservers.append(nc.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in self?.pipOnLeaveApp() })
+        pipObservers.append(nc.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in self?.pipOnReturnApp() })
+    }
+
+    private func pipOnLeaveApp() {
+        guard phase == .recording else { return }
+        bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in
+            guard let self, self.bgTask != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(self.bgTask)
+            self.bgTask = .invalid
+        }
+        if pipController?.isPictureInPictureActive != true {
+            pipController?.startPictureInPicture()
+        }
+    }
+
+    private func pipOnReturnApp() {
+        if pipController?.isPictureInPictureActive == true {
+            pipController?.stopPictureInPicture()
+        }
+        if bgTask != .invalid {
+            UIApplication.shared.endBackgroundTask(bgTask)
+            bgTask = .invalid
+        }
     }
 
     private func stopPiP() {
@@ -672,15 +715,22 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         // (crash 2026-08-21-141441: UIWindow._setHidden off-main → SIGTRAP).
         let controller = pipController
         let layer = pipDisplayLayer
+        let observers = pipObservers
+        pipObservers = []
         pipController = nil
         pipDisplayLayer = nil
         DispatchQueue.main.async { [weak self] in
+            observers.forEach { NotificationCenter.default.removeObserver($0) }
             controller?.stopPictureInPicture()
             layer?.flush()
             self?.pipHost?.removeFromSuperview()
             self?.pipHost = nil
             self?.pipWindow?.isHidden = true
             self?.pipWindow = nil
+            if let self, self.bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(self.bgTask)
+                self.bgTask = .invalid
+            }
         }
     }
 

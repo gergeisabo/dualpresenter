@@ -57,8 +57,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
            Date().timeIntervalSince(startedAt) > 10 {
             writer.setCommand(.ended)
             self.writer = nil
-            finishBroadcastWithError(
-                NSError(domain: "DualPresenter.BUE", code: 0))
+            finishBroadcastQuietly()
             return
         }
 
@@ -70,8 +69,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             if writer.pendingCommand == .stopRequested {
                 writer.setCommand(.ended)
                 self.writer = nil
-                finishBroadcastWithError(
-                    NSError(domain: "DualPresenter.BUE", code: 0))
+                finishBroadcastQuietly()
                 return
             }
             guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer)
@@ -119,5 +117,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
         default:
             break
         }
+    }
+
+    /// ReplayKit only lets the extension stop via finishBroadcastWithError.
+    /// userDeclined is the "user stopped" code — iOS does not show our
+    /// DualPresenter.BUE alert.
+    private func finishBroadcastQuietly() {
+        finishBroadcastWithError(NSError(
+            domain: RPRecordingErrorDomain,
+            code: RPRecordingErrorCode.userDeclined.rawValue,
+            userInfo: nil))
     }
 }

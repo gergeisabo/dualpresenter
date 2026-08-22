@@ -25,6 +25,9 @@ targets:
         NSCameraUsageDescription: DualPresenter records the back camera view of the content you present.
         NSMicrophoneUsageDescription: DualPresenter records your voice together with the presentation.
         NSPhotoLibraryAddUsageDescription: DualPresenter saves finished videos to your photo library.
+        UIBackgroundModes:
+          - audio
+          - voip
     entitlements:
       path: App/DualPresenter.entitlements
       properties:
