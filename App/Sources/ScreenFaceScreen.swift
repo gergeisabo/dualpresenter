@@ -86,18 +86,23 @@ struct ScreenFaceScreen: View {
     }
 
     private var recordingView: some View {
-        VStack(spacing: 18) {
-            HStack(spacing: 8) {
-                Circle().fill(.red).frame(width: 12, height: 12)
-                Text(elapsedText(recorder.elapsed))
-                    .font(.system(size: 28, weight: .semibold).monospacedDigit())
-                    .foregroundStyle(.white)
+        ZStack {
+            ScreenFaceBubble(
+                recorder: recorder,
+                placement: $placement,
+                bubbleSize: 110
+            )
+            VStack(spacing: 18) {
+                HStack(spacing: 8) {
+                    Circle().fill(.red).frame(width: 12, height: 12)
+                    Text(elapsedText(recorder.elapsed))
+                        .font(.system(size: 28, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.white)
+                }
+                Text("Recording. Your face stays on screen.")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.75))
             }
-            Text("Recording. Tap your face bubble to come back here.")
-                .font(.subheadline)
-                .foregroundStyle(.white.opacity(0.75))
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 28)
         }
     }
 

@@ -408,13 +408,14 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         guard videoInput.isReadyForMoreMediaData else { return }
 
         let pts = frame.pts
-        if !sessionStartTime.isValid { sessionStartTime = pts }
-        // PTS monotonicity: AVAssetWriter demands strictly increasing
-        // timestamps; pollVideo grabs the NEWEST frame each 10ms tick, so
-        // duplicates/regressions are normal — drop the frame, keep recording.
+        if !writerStarted {
+            sessionStartTime = pts
+            writer.startSession(atSourceTime: pts)
+            writerStarted = true
+        }
         guard CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
         if let last = lastVideoPTS, CMTimeCompare(pts, last) <= 0 {
-            return  // duplicate/regressed frame — skip, keep recording
+            return
         }
         lastVideoPTS = pts
 
@@ -429,10 +430,6 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
             placement: bubblePlacement, dest: dest)
         CVPixelBufferUnlockBaseAddress(dest, [])
 
-        if !writerStarted {
-            writer.startSession(atSourceTime: pts)
-            writerStarted = true
-        }
         if !adaptor.append(dest, withPresentationTime: pts) {
             let nsErr = writer.error as NSError?
             let code = nsErr?.code ?? 0
@@ -447,38 +444,32 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     private func appendAudio(_ chunk: FrameBridge.AudioChunk) {
         guard phase == .recording else { return }
         guard let appAudioInput, appAudioInput.isReadyForMoreMediaData else { return }
-        let pts = chunk.pts
-        if !sessionStartTime.isValid { sessionStartTime = pts }
+        guard writerStarted else { return }
+        // Screen frames take a moment to cross the bridge; shift sound
+        // later so picture and phone audio line up.
+        let pts = chunk.pts + CMTime(seconds: 0.22, preferredTimescale: 600)
         guard CMTimeCompare(pts, sessionStartTime) >= 0 else { return }
         if let last = lastAppAudioPTS, CMTimeCompare(pts, last) < 0 { return }
         lastAppAudioPTS = pts
-        guard let sample = makeRawAudioBuffer(chunk) else { return }
-        if !writerStarted, let writer {
-            writer.startSession(atSourceTime: pts)
-            writerStarted = true
-        }
+        guard let sample = makeRawAudioBuffer(chunk, pts: pts) else { return }
         _ = appAudioInput.append(sample)
     }
 
     private func appendMic(_ sampleBuffer: CMSampleBuffer) {
         guard phase == .recording else { return }
         guard let micAudioInput, micAudioInput.isReadyForMoreMediaData else { return }
-        guard sessionStartTime.isValid else { return }
+        guard writerStarted else { return }
         let srcPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if !firstMicPTS.isValid { firstMicPTS = srcPTS }
         let pts = sessionStartTime + (srcPTS - firstMicPTS)
+            + CMTime(seconds: 0.22, preferredTimescale: 600)
         if let last = lastMicPTS, CMTimeCompare(pts, last) < 0 { return }
         lastMicPTS = pts
-        // ReplayKit and capture clocks differ — retag PTS onto a copy.
         guard let retagged = retag(sampleBuffer, pts: pts) else { return }
-        if !writerStarted, let writer {
-            writer.startSession(atSourceTime: pts)
-            writerStarted = true
-        }
         _ = micAudioInput.append(retagged)
     }
 
-    private func makeRawAudioBuffer(_ chunk: FrameBridge.AudioChunk) -> CMSampleBuffer? {
+    private func makeRawAudioBuffer(_ chunk: FrameBridge.AudioChunk, pts: CMTime) -> CMSampleBuffer? {
         var asbd = chunk.asbd
         guard asbd.mSampleRate > 0, asbd.mBytesPerFrame > 0 else { return nil }
         let frames = chunk.data.count / Int(asbd.mBytesPerFrame)
@@ -504,7 +495,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: CMTimeValue(frames),
                              timescale: CMTimeScale(asbd.mSampleRate)),
-            presentationTimeStamp: chunk.pts,
+            presentationTimeStamp: pts,
             decodeTimeStamp: .invalid)
         var sbuf: CMSampleBuffer?
         let st1 = withUnsafePointer(to: &timing) { timingPtr in
@@ -680,9 +671,8 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
     }
 
     private func pipOnReturnApp() {
-        if pipController?.isPictureInPictureActive == true {
-            pipController?.stopPictureInPicture()
-        }
+        // Keep the face bubble alive. Stopping PiP here made the camera
+        // disappear until the user restarted the whole broadcast.
         if bgTask != .invalid {
             UIApplication.shared.endBackgroundTask(bgTask)
             bgTask = .invalid
