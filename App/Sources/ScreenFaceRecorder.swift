@@ -3,6 +3,7 @@ import AVKit
 import Combine
 import CoreMedia
 import os
+import Photos
 import ReplayKit
 import UIKit
 
@@ -316,6 +317,7 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
         phase = .idle
         reader = nil
         if ok, let url {
+            PhotosSaver.saveVideo(url) { _ in }
             publish(.finished(url))
         } else {
             publish(.error("The recording could not be saved."))
@@ -587,8 +589,8 @@ final class ScreenFaceRecorder: NSObject, ObservableObject, @unchecked Sendable 
                                          audio: AVAssetWriterInput,
                                          adaptor: AVAssetWriterInputPixelBufferAdaptor,
                                          url: URL) {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DP-\(UUID().uuidString)").appendingPathExtension("mp4")
         let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
         // Width/height REQUIRED on iOS 18 (crash lesson 155017).

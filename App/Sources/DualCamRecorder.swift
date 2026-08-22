@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import CoreMedia
+import Photos
 import UIKit
 
 /// Dual-camera capture engine (M1 "Dual Cam" mode), RØDE-Combined-style:
@@ -223,6 +224,7 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
         teardownWriter(cancel: false)
         phase = .ready
         if ok, let url {
+            PhotosSaver.saveVideo(url) { _ in }
             publish(.finished(url))
         } else {
             publish(.error("The recording could not be saved."))
@@ -236,8 +238,8 @@ final class DualCamRecorder: NSObject, ObservableObject, @unchecked Sendable {
                                          audio: AVAssetWriterInput,
                                          adaptor: AVAssetWriterInputPixelBufferAdaptor,
                                          url: URL) {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DP-\(UUID().uuidString)").appendingPathExtension("mp4")
         let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
         // Width/height are REQUIRED on iOS 18 — omitting them throws
