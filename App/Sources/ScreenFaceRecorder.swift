@@ -897,7 +897,7 @@ final class FacePipViewController: AVPictureInPictureVideoCallViewController {
         layer.frame = view.bounds
     }
 
-    func enqueue(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+    nonisolated func enqueue(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
         var formatDescription: CMVideoFormatDescription?
         let fc = CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault,
